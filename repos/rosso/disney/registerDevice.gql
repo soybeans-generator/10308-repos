@@ -1,8 +1,0 @@
-mutation registerDevice($input: RegisterDeviceInput!) {
-   registerDevice(registerDevice: $input) {
-      token {
-         accessToken
-         accessTokenType
-      }
-   }
-}

@@ -1,7 +1,0 @@
-mutation refreshToken($input: RefreshTokenInput!) {
-   refreshToken(refreshToken: $input) {
-      activeSession {
-         sessionId
-      }
-   }
-}
