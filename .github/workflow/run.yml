@@ -1,0 +1,56 @@
+name: Clone Codeberg repos
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # daily, 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: Codeberg user/org
+        default: "26"
+
+permissions:
+  contents: write
+
+env:
+  OWNER: ${{ inputs.owner || '26' }}
+
+jobs:
+  clone:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: List repos
+        run: |
+          base="https://codeberg.org/api/v1/users/${OWNER}/repos"
+          curl -fsS "${base}?limit=1" >/dev/null 2>&1 || base="https://codeberg.org/api/v1/orgs/${OWNER}/repos"
+          page=1
+          : > repos.txt
+          while :; do
+            out=$(curl -fsS "${base}?page=${page}&limit=50")
+            urls=$(echo "$out" | jq -r '.[] | "\(.name) \(.clone_url)"')
+            [ -z "$urls" ] && break
+            echo "$urls" >> repos.txt
+            page=$((page+1))
+          done
+          echo "Repos found: $(wc -l < repos.txt)"
+
+      - name: Clone repos
+        run: |
+          rm -rf repos && mkdir repos
+          while read -r name url; do
+            git clone --depth 1 "$url" "repos/$name" || echo "FAILED: $url"
+            rm -rf "repos/$name/.git"
+          done < repos.txt
+          rm repos.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Sync Codeberg repos from ${OWNER}"
+          git push
