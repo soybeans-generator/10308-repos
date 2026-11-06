@@ -21,6 +21,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: List repos
         run: |
@@ -30,27 +37,26 @@ jobs:
           : > repos.txt
           while :; do
             out=$(curl -fsS "${base}?page=${page}&limit=50")
-            urls=$(echo "$out" | jq -r '.[] | "\(.name) \(.clone_url)"')
+            urls=$(echo "$out" | jq -r '.[] | select(.empty == false) | "\(.name) \(.clone_url) \(.default_branch)"')
             [ -z "$urls" ] && break
             echo "$urls" >> repos.txt
             page=$((page+1))
           done
           echo "Repos found: $(wc -l < repos.txt)"
 
-      - name: Clone repos
+      - name: Add or update subtrees
         run: |
-          rm -rf repos && mkdir repos
-          while read -r name url; do
-            git clone --depth 1 "$url" "repos/$name" || echo "FAILED: $url"
-            rm -rf "repos/$name/.git"
+          mkdir -p repos
+          while read -r name url branch; do
+            if [ -d "repos/$name" ]; then
+              git subtree pull --prefix="repos/$name" "$url" "$branch" -m "Update $name from Codeberg" \
+                || echo "FAILED pull: $name"
+            else
+              git subtree add --prefix="repos/$name" "$url" "$branch" -m "Add $name from Codeberg" \
+                || echo "FAILED add: $name"
+            fi
           done < repos.txt
           rm repos.txt
 
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet && echo "No changes" && exit 0
-          git commit -m "Sync Codeberg repos from ${OWNER}"
-          git push
+      - name: Push
+        run: git push
