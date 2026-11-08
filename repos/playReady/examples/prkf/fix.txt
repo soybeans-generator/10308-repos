@@ -1,0 +1,13 @@
+remove bloat
+
+replace hand written ECC
+
+small main
+
+speed
+
+stupid for loops
+
+combine flags
+
+re order flags
