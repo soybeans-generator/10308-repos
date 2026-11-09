@@ -1,5 +1,10 @@
 # activation
 
+~~~
+cl /nologo /EHsc /std:c++17 prindiv.cpp /link mfuuid.lib propsys.lib ole32.lib
+.\prindiv.exe $env:USERPROFILE\prstore
+~~~
+
 the way it works, the activation request primary payload is a static blob with
 the devices hwid and then aes ctr with a key made from a seed, the seed is
 stored in the last 16 bytes of the primary payload unencrypted, it wraps the

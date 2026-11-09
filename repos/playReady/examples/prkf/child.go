@@ -3,43 +3,28 @@
 
 // Every body this binary re-executes, and the process plumbing they share.
 //
-//   -4's trials      dpWorkerP1, dpWorkerP2
+//   -6's trials      dpWorkerP1, dpWorkerP2
 //   -3's sweep       dmWorker
 //   trial prep       pfImage, pfPrep, apply
 //   spawn helpers    runCollect, probeBatch, dmSweep
 //
-// No goroutines, channels or mutexes anywhere in this program. Speed comes from
-// doing less work per child: the descriptor census is cached in the profile by -2,
-// so a child reads the image and patches a few dozen coalesced runs instead of
-// hashing several gigabytes.
+// A CHILD IS IDENTIFIED BY ITS ENVIRONMENT, NOT BY ITS ARGUMENTS. Every body here is
+// selected by one environment variable and is passed no arguments at all, so no child
+// mode can appear in `prkf -h` and every step has an empty command line.
 //
-// # WHY A CHILD IS A SEPARATE PROCESS
+// WHY A CHILD IS A SEPARATE PROCESS: a fault in a descriptor's code is a Windows SEH
+// exception raised inside the DLL, not a Go panic. recover() never runs and the whole
+// process dies, so one child per candidate confines a fault to that candidate.
 //
-// A fault in a descriptor's code is a Windows SEH exception raised inside the DLL,
-// not a Go panic. recover() never runs and the whole process dies, so one child per
-// candidate confines a fault to that candidate. Across 981 arbitrary code blobs that
-// is the normal case, not an edge case.
-//
-// # WHAT A TRIAL REPORTS
-//
-// op=3 gets a 0x20-byte key and two 0x20-byte buffers, and a routine may write to
-// either or both. Nothing states which, so every row carries BOTH buffers and the
-// parent decides. Row format, both phases:
+// WHAT A TRIAL REPORTS: op=3 gets a 0x20-byte key and two 0x20-byte buffers, and a
+// routine may write to either or both. Nothing states which, so every row carries BOTH
+// buffers and the parent decides. Row format, both phases:
 //
 //   RES <i> <half> <a> <b>             two 0x20-byte buffers, hex
 //   RES <i> <half> REJECT rc=.. st=..  the routine refused
 //
-// # THE -3 SWEEP CHILD
-//
-// -3's child is a different shape: one image patch, then every requested family,
-// and a table of rows rather than one verdict. It lives here with the trial
-// children because it shares the prep and the spawn helpers; its driver-side
-// parser is dmSweep below.
-//
-// # EXIT CODES
-//
-// Nothing here calls os.Exit. Children return their code: 0 after their rows, 2 for
-// a bad command line, 4 when the module cannot be loaded, 5 on bad input or a
+// EXIT CODES: nothing here calls os.Exit. Children return their code: 0 after their
+// rows, 2 for a bad payload, 4 when the module cannot be loaded, 5 on bad input or a
 // recovered panic, 6 when no fault handler could be installed.
 package main
 
@@ -60,14 +45,24 @@ import (
    "unsafe"
 )
 
+// Child modes. A child is this binary re-executed with one of these set and NO
+// arguments at all: the environment carries the mode because it is internal plumbing.
+//
+// Fields are ';'-separated and list items ','-separated.
+const (
+   probeEnv = "PRKF_PROBE_DESCS" // descriptor VAs, comma-separated                  -1
+   sweepEnv = "PRKF_SWEEP"       // <descRVA>;<families>;<sets>                      -3
+   trialEnv = "PRKF_TRIAL"       // p1;<desc>,... | p2;<start>;<obf>,...;<desc>,...  -6
+)
+
 // ------------------------------------------------------- the -3 sweep child
 
-// dmCLEN is one full bijection set: 64 blocks of 16 bytes, 0x400 in all. It is read
-// by both the scan (nibblemap.go) and the patch, so it lives at package scope.
+// dmCLEN is one full bijection set: 64 blocks of 16 bytes, 0x400 in all. It is read by
+// both the scan (nibblemap.go) and the patch, so it lives at package scope.
 const dmCLEN = 0x400
 
+// Static, never-moved scratch handed to native code.
 var (
-   // Static, never-moved scratch handed to native code.
    dmST  [0x40]byte
    dmOUT [0x100]byte
    dmKB  [0x48]byte
@@ -78,6 +73,33 @@ var (
 // selfPath and selfErr are resolved once at init: three drivers spawn children of
 // themselves and each needs the same answer.
 var selfPath, selfErr = os.Executable()
+
+// childMode reports whether this process was started as one of the re-executed
+// children, and runs it if so. Called from main before the FlagSet exists: a child
+// passes no arguments, so there is nothing for the FlagSet to parse.
+//
+// An error means the payload was malformed, which is a spawn bug rather than a data
+// problem, so main exits 2 on it.
+func childMode() (code int, ok bool, err error) {
+   if s := os.Getenv(probeEnv); s != "" {
+      descs, valid := dpDescList(strings.Split(s, ","))
+      if !valid {
+         return 0, true, fmt.Errorf("%s=%q: not a descriptor list", probeEnv, s)
+      }
+      return runProbes(descs), true, nil
+   }
+   if s := os.Getenv(sweepEnv); s != "" {
+      f := strings.Split(s, ";")
+      if len(f) != 3 {
+         return 0, true, fmt.Errorf("%s=%q: want <descRVA>;<families>;<sets>", sweepEnv, s)
+      }
+      return dmWorker(f[0], f[1], f[2]), true, nil
+   }
+   if s := os.Getenv(trialEnv); s != "" {
+      return dpTrialChild(s), true, nil
+   }
+   return 0, false, nil
+}
 
 // dmCall runs the consumer on one blob with the given 0x41-byte key and returns
 // (ntstatus, status dword, 0x20-byte output). It is the one place the consumer's
@@ -118,8 +140,8 @@ func dmLoadFail(f string, a ...any) int {
 }
 
 // dmOut validates the field a child prints for one result: exactly 32 bytes of hex.
-// Checking here rather than at the point of use means a format regression is
-// reported against the row that caused it.
+// Checking here rather than at the point of use means a format regression is reported
+// against the row that caused it.
 func dmOut(s string) (string, bool) {
    if len(s) != 0x40 {
       return "", false
@@ -130,13 +152,13 @@ func dmOut(s string) (string, bool) {
    return s, true
 }
 
-// dmPrv is a synthetic 0x41-byte key component. Deterministic and free of structure
-// the routine could special-case: the first 0x40 bytes are a fixed non-repeating
-// pattern, and byte 0x40 - the family selector - is the family.
+// dmPrv is a synthetic 0x41-byte key component. Deterministic and free of structure the
+// routine could special-case: the first 0x40 bytes are a fixed non-repeating pattern,
+// and byte 0x40 - the family selector - is the family.
 //
-// Only -3 uses it. -4 drives the real key, because the stage routines reject
-// material that is not real; forcing the table here collapses whatever this key
-// derives, so its bytes cannot matter.
+// Only -3 uses it. -6 drives the real key, because the stage routines reject material
+// that is not real; forcing the table here collapses whatever this key derives, so its
+// bytes cannot matter.
 func dmPrv(family int) []byte {
    p := make([]byte, 0x41)
    for i := 0; i < 0x40; i++ {
@@ -146,11 +168,13 @@ func dmPrv(family int) []byte {
    return p
 }
 
-// dmWorker is the sweep child. One image patch, then every family: find the live
-// set with one licence, sweep it with fifteen.
+// dmWorker is the sweep child. One image patch, then every family: find the live set
+// with one licence, sweep it with fifteen.
+//
+// Its three arguments arrive as the three fields of sweepEnv; nothing else calls it.
 func dmWorker(descArg, famsArg, setsArg string) int {
    if descArg == "" || famsArg == "" || setsArg == "" {
-      fmt.Fprintln(os.Stderr, "usage: prkf -3 sweep <descRVA> <families> <sets>")
+      fmt.Fprintln(os.Stderr, "prkf: "+sweepEnv+": want <descRVA>;<families>;<sets>")
       return 2
    }
    desc, err := strconv.ParseUint(descArg, 0, 32)
@@ -202,9 +226,7 @@ func dmWorker(descArg, famsArg, setsArg string) int {
 
    // A false return means the child runs unprotected: a fault then kills it with no
    // FAULT line, and the driver reads that as missing rows.
-   if !wbVEH(base, func(s string) {
-      fmt.Println(s)
-   }) {
+   if !wbVEH(base) {
       return dmLoadFail("AddVectoredExceptionHandler returned NULL")
    }
 
@@ -226,9 +248,9 @@ func dmWorker(descArg, famsArg, setsArg string) int {
       prv := dmPrv(f)
 
       // ---- phase 1: which set does this family read? ----------------------
-      // One licence is enough: forcing 16 different nibbles through a table the
-      // routine actually reads gives 16 different scalars, hence 16 different
-      // outputs. A set it never reads gives the same output 16 times.
+      // One licence is enough: forcing 16 different nibbles through a table the routine
+      // actually reads gives 16 different scalars, hence 16 different outputs. A set it
+      // never reads gives the same output 16 times.
       liveIdx, nLive := -1, 0
       for i, srva := range sets {
          orig := readSet(srva)
@@ -269,8 +291,8 @@ func dmWorker(descArg, famsArg, setsArg string) int {
       fmt.Printf("LIVE %d %d 0x%x\n", f, liveIdx, srva)
 
       // ---- phase 2: the full permutation ---------------------------------
-      // Forced nibble outer, licence inner: one protection flip per forced value
-      // instead of one per call.
+      // Forced nibble outer, licence inner: one protection flip per forced value instead
+      // of one per call.
       orig := readSet(srva)
       for mm := 0; mm < 16; mm++ {
          if err := force(srva, byte(mm)); err != nil {
@@ -297,66 +319,15 @@ func dpHalf(prv []byte, h int) []byte {
    return prv[0:0x20]
 }
 
-// dpOp3 issues one WbHeapExecuteCall. It returns a closure over `base`, because a
-// plain function would need nine parameters to say the same thing.
-//
-// It is not newWbArgs: the trial path passes a variable args length and writes a
-// second size dword at +0x2C, which is wbArgs's blank padding and therefore
-// unaddressable from Go.
-//
-// No runtime.KeepAlive is needed: syscall.(*LazyProc).Call is declared
-// //go:uintptrescapes, so the compiler treats every converted pointer here as
-// escaping for the duration of the call.
-func dpOp3(base uintptr) func(descRVA, ln uint32, status, kb, out []byte, size2 *uint32) uint32 {
-   return func(descRVA, ln uint32, status, kb, out []byte, size2 *uint32) uint32 {
-      var a [0x40]byte
-      binary.LittleEndian.PutUint64(a[0x00:], 3)
-      binary.LittleEndian.PutUint64(a[0x08:], uint64(base)+uint64(descRVA))
-      binary.LittleEndian.PutUint64(a[0x10:], uint64(uintptr(unsafe.Pointer(&status[0]))))
-      binary.LittleEndian.PutUint64(a[0x18:], uint64(uintptr(unsafe.Pointer(&kb[0]))))
-      binary.LittleEndian.PutUint32(a[0x20:], 0x20)
-      binary.LittleEndian.PutUint64(a[0x24:], uint64(uintptr(unsafe.Pointer(&out[0]))))
-      if size2 != nil {
-         binary.LittleEndian.PutUint32(a[0x2C:], *size2)
-      }
-      r, _, _ := wbNtQuery.Call(0xB9, uintptr(unsafe.Pointer(&a[0])), uintptr(ln), 0)
-      return uint32(r)
-   }
-}
+// ------------------------------------------------------- the -6 trial child
 
-// dpPrepChild loads what a trial needs and patches the image. It is the one place a
-// child pays its fixed cost, so both trial bodies call it and nothing else does.
-func dpPrepChild() (op3 func(uint32, uint32, []byte, []byte, []byte, *uint32) uint32,
-   prv []byte, code int, err error) {
-
-   pi, err := pfPrep()
-   if err != nil {
-      return nil, nil, 5, err
-   }
-   if prv, err = dpPrv(); err != nil {
-      return nil, nil, 5, err
-   }
-   base, err := loadWarbird()
-   if err != nil {
-      return nil, nil, 4, err
-   }
-   pi.apply(base)
-
-   if !wbVEH(base, func(s string) { fmt.Println(s) }) {
-      return nil, nil, 6, fmt.Errorf("AddVectoredExceptionHandler returned NULL")
-   }
-   return dpOp3(base), prv, 0, nil
-}
-
-// ------------------------------------------------------- the -4 trial child
-
-// dpPrv reads the sample's 0x41-byte key component. Every trial drives it: the
-// stage routines reject key material that is not real, which is why a synthetic key
-// made the search unfindable.
+// dpPrv reads the sample's 0x41-byte key component. Every trial drives it: the stage
+// routines reject key material that is not real, which is why a synthetic key made the
+// search unfindable.
 func dpPrv() ([]byte, error) {
    prv, err := os.ReadFile(encPrvPath)
    if err != nil {
-      return nil, fmt.Errorf("missing %s - run prkf -5 first", encPrvPath)
+      return nil, fmt.Errorf("missing %s - run prkf -4 first", encPrvPath)
    }
    if len(prv) != 0x41 {
       return nil, fmt.Errorf("%s is %d bytes, expected 0x41 (65)", encPrvPath, len(prv))
@@ -364,12 +335,10 @@ func dpPrv() ([]byte, error) {
    return prv, nil
 }
 
-// dpStage1 is the stage-1 call: a 0x20-byte key half in the key buffer, 0x2C bytes
-// of arguments, no second size. Both buffers are returned, because which one the
-// routine treats as its output is not established.
-func dpStage1(op3 func(uint32, uint32, []byte, []byte, []byte, *uint32) uint32,
-   desc uint32, key []byte) (out, kb []byte, rc uint32, st []byte) {
-
+// dpStage1 is the stage-1 call: a 0x20-byte key half in the key buffer, 0x2C bytes of
+// arguments, no second size. Both buffers are returned, because which one the routine
+// treats as its output is not established.
+func dpStage1(op3 op3Func, desc uint32, key []byte) (out, kb []byte, rc uint32, st []byte) {
    st1 := make([]byte, 0x40)
    b1 := make([]byte, 0x40)
    b2 := make([]byte, 0x40)
@@ -379,11 +348,9 @@ func dpStage1(op3 func(uint32, uint32, []byte, []byte, []byte, *uint32) uint32,
    return b2[:0x20], b1[:0x20], rc, st1[:4]
 }
 
-// dpStage2 runs one stage-2 trial: the OBF in the key buffer, a 0x20-byte key half
-// in the output buffer, 0x30 bytes of arguments with a second size dword.
-func dpStage2(op3 func(uint32, uint32, []byte, []byte, []byte, *uint32) uint32,
-   desc uint32, obf, key []byte) (kb, out []byte, rc uint32, st []byte) {
-
+// dpStage2 runs one stage-2 trial: the OBF in the key buffer, a 0x20-byte key half in
+// the output buffer, 0x30 bytes of arguments with a second size dword.
+func dpStage2(op3 op3Func, desc uint32, obf, key []byte) (kb, out []byte, rc uint32, st []byte) {
    st2 := make([]byte, 0x40)
    b1 := make([]byte, 0x40)
    b2 := make([]byte, 0x40)
@@ -396,10 +363,6 @@ func dpStage2(op3 func(uint32, uint32, []byte, []byte, []byte, *uint32) uint32,
 }
 
 // dpWorkerP1 is the stage-1 probe: every candidate, both key halves, both buffers.
-//
-// Reporting both buffers is what makes the search exhaustive rather than a guess:
-// the routine is handed a 0x20-byte key and two 0x20-byte buffers, and nothing
-// establishes which one it treats as output.
 func dpWorkerP1(descs []uint32) (code int) {
    say := func(f string, a ...any) { fmt.Printf("S1 "+f+"\n", a...) }
    defer func() {
@@ -466,11 +429,11 @@ func dpWorkerP2(start int, obfs []string, descs []uint32) (code int) {
 }
 
 // probeBatch re-executes this binary as a probe child for a list of descriptors and
-// returns the RESULT line each one produced, keyed by descriptor VA. A descriptor
-// with no line faulted or was never reached, and the caller retries it alone.
+// returns the RESULT line each one produced, keyed by descriptor VA. A descriptor with
+// no line faulted or was never reached, and the caller recovers it.
 //
-// stderr is streamed into w as it arrives rather than buffered: a child that hangs
-// never exits, and the last trace line is the only evidence of where.
+// stderr is streamed into w as it arrives rather than buffered: a child that hangs never
+// exits, and the last trace line is the only evidence of where.
 func probeBatch(descs []imgDesc, w func(string)) map[uint32]string {
    out := map[uint32]string{}
    if len(descs) == 0 {
@@ -534,10 +497,10 @@ func probeBatch(descs []imgDesc, w func(string)) map[uint32]string {
    return out
 }
 
-// dmFam is one family's rows from a sweep child.
+// dmFam is one family's rows from a sweep child. nLive is 1 when exactly one set
+// answered 16 distinct outputs; liveRVA is that set.
 type dmFam struct {
    nLive   int
-   liveIdx int
    liveRVA uint32
    outs    map[int]map[int]string // licence -> forced nibble -> hex
 }
@@ -561,12 +524,8 @@ func dmSweep(descRVA uint32, fams []int, sets []uint32) dmResult {
    for i, x := range sets {
       rs[i] = fmt.Sprintf("0x%x", x)
    }
-   p := runCollect([]string{
-      "-3", "sweep",
-      fmt.Sprintf("0x%x", descRVA),
-      strings.Join(fs, ","),
-      strings.Join(rs, ","),
-   }, 30*time.Minute)
+   p := runCollect(sweepEnv+"=0x"+strconv.FormatUint(uint64(descRVA), 16)+";"+
+      strings.Join(fs, ",")+";"+strings.Join(rs, ","), 30*time.Minute)
 
    r := dmResult{fams: map[int]*dmFam{}, rc: p.rc}
    if p.err != nil {
@@ -576,7 +535,7 @@ func dmSweep(descRVA uint32, fams []int, sets []uint32) dmResult {
 
    fam := func(i int) *dmFam {
       if r.fams[i] == nil {
-         r.fams[i] = &dmFam{liveIdx: -1, outs: map[int]map[int]string{}}
+         r.fams[i] = &dmFam{outs: map[int]map[int]string{}}
       }
       return r.fams[i]
    }
@@ -599,14 +558,14 @@ func dmSweep(descRVA uint32, fams []int, sets []uint32) dmResult {
             return r
          }
          v, e1 := strconv.Atoi(f[1])
-         i, e2 := strconv.Atoi(f[2])
+         _, e2 := strconv.Atoi(f[2]) // set index: validated, not retained
          rva, e3 := strconv.ParseUint(f[3], 0, 32)
          if e1 != nil || e2 != nil || e3 != nil {
             r.loadfail = "LOADFAIL malformed LIVE row: " + ln
             return r
          }
          fm := fam(v)
-         fm.liveIdx, fm.liveRVA, fm.nLive = i, uint32(rva), 1
+         fm.liveRVA, fm.nLive = uint32(rva), 1
       case "NOLIVE":
          if len(f) < 3 {
             r.loadfail = "LOADFAIL malformed NOLIVE row: " + ln
@@ -647,9 +606,9 @@ func dmSweep(descRVA uint32, fams []int, sets []uint32) dmResult {
    return r
 }
 
-// dmSweepAll is dmSweep plus the fault fallback: one child covers all families, so
-// a fault costs every family at once. Re-running one family at a time salvages the
-// ones that did not fault, and costs nothing when the batch succeeds.
+// dmSweepAll is dmSweep plus the fault fallback: one child covers all families, so a
+// fault costs every family at once. Re-running one family at a time salvages the ones
+// that did not fault, and costs nothing when the batch succeeds.
 func dmSweepAll(descRVA uint32, fams []int, sets []uint32, logf func(string, ...any)) dmResult {
    r := dmSweep(descRVA, fams, sets)
    if r.loadfail != "" || len(fams) <= 1 {
@@ -677,12 +636,63 @@ func dmSweepAll(descRVA uint32, fams []int, sets []uint32, logf func(string, ...
    return r
 }
 
+// op3Func is one op=3 call: descriptor RVA, argument-block length, status buffer, key
+// buffer, output buffer, and the optional second size dword.
+type op3Func func(descRVA, ln uint32, status, kb, out []byte, size2 *uint32) uint32
+
+// dpOp3 issues one WbHeapExecuteCall. It returns a closure over `base`, because a plain
+// function would need nine parameters to say the same thing.
+//
+// It is not newWbArgs: the trial path passes a variable args length and writes a second
+// size dword at +0x2C, which is wbArgs's blank padding and therefore unaddressable from
+// Go.
+//
+// No runtime.KeepAlive is needed: syscall.(*LazyProc).Call is declared
+// //go:uintptrescapes.
+func dpOp3(base uintptr) op3Func {
+   return func(descRVA, ln uint32, status, kb, out []byte, size2 *uint32) uint32 {
+      var a [0x40]byte
+      binary.LittleEndian.PutUint64(a[0x00:], 3)
+      binary.LittleEndian.PutUint64(a[0x08:], uint64(base)+uint64(descRVA))
+      binary.LittleEndian.PutUint64(a[0x10:], uint64(uintptr(unsafe.Pointer(&status[0]))))
+      binary.LittleEndian.PutUint64(a[0x18:], uint64(uintptr(unsafe.Pointer(&kb[0]))))
+      binary.LittleEndian.PutUint32(a[0x20:], 0x20)
+      binary.LittleEndian.PutUint64(a[0x24:], uint64(uintptr(unsafe.Pointer(&out[0]))))
+      if size2 != nil {
+         binary.LittleEndian.PutUint32(a[0x2C:], *size2)
+      }
+      r, _, _ := wbNtQuery.Call(0xB9, uintptr(unsafe.Pointer(&a[0])), uintptr(ln), 0)
+      return uint32(r)
+   }
+}
+
+// dpPrepChild loads what a trial needs and patches the image. It is the one place a
+// child pays its fixed cost, so both trial bodies call it and nothing else does.
+func dpPrepChild() (op3 op3Func, prv []byte, code int, err error) {
+   pi, err := pfPrep()
+   if err != nil {
+      return nil, nil, 5, err
+   }
+   if prv, err = dpPrv(); err != nil {
+      return nil, nil, 5, err
+   }
+   base, err := loadWarbird()
+   if err != nil {
+      return nil, nil, 4, err
+   }
+   pi.apply(base)
+
+   if !wbVEH(base) {
+      return nil, nil, 6, fmt.Errorf("AddVectoredExceptionHandler returned NULL")
+   }
+   return dpOp3(base), prv, 0, nil
+}
+
 // ------------------------------------------------------------- the trial prep
 
 // pfImage is everything a trial child or a -3 sweep needs: the decrypted image, the
-// census, and the patch plan. It deliberately does NOT include the module: a child
-// used to read the DLL and re-run scanDescs, which hashes several gigabytes, and
-// that was the cost of every child and therefore of every fault.
+// census, and the patch plan. It deliberately does NOT include the module: a child used
+// to read the DLL and re-run scanDescs, which hashes several gigabytes.
 type pfImage struct {
    sha    string
    size   uint32
@@ -692,10 +702,9 @@ type pfImage struct {
    merged []imgInterval
 }
 
-// pfPrep loads the census and the image. The size check is what proves the image on
-// disk came from this build: the image's own hash changes every run, because
-// LoadLibraryW bakes the load base into relocated fields, but SizeOfImage is a
-// per-build constant.
+// pfPrep loads the census and the image. The size check is what proves the image on disk
+// came from this build: the image's own hash changes every run, because LoadLibraryW
+// bakes the load base into relocated fields, but SizeOfImage is a per-build constant.
 func pfPrep() (*pfImage, error) {
    raw, err := os.ReadFile(profilePath)
    if err != nil {
@@ -732,9 +741,9 @@ func pfPrep() (*pfImage, error) {
 // heap-exec blocks the kernel decrypts itself.
 //
 // Every span is written, not just the ones that differ from the file: writing the
-// image's own bytes over an unencrypted span is a no-op, and skipping the comparison
-// is what lets a child avoid reading the module at all. The runs are coalesced
-// first, so the protection flips number in the dozens.
+// image's own bytes over an unencrypted span is a no-op, and skipping the comparison is
+// what lets a child avoid reading the module at all. The runs are coalesced first, so
+// the protection flips number in the dozens.
 func (p *pfImage) apply(base uintptr) (patched, skipped int) {
    var runs []imgRun
    for _, s := range p.spans {
@@ -761,36 +770,37 @@ func (p *pfImage) apply(base uintptr) (patched, skipped int) {
 
 // ------------------------------------------------------------ spawn helpers
 
-// procOut is one collected child run.
+// procOut is one collected child run. rc is -1 when the child produced no verdict: it
+// was killed by the deadline, or it could not be started at all, which is the one case
+// err reports.
 type procOut struct {
-   stdout   []byte
-   stderr   []byte
-   rc       int
-   timedOut bool
-   err      error // set only when the process could not be run at all
+   stdout []byte
+   rc     int
+   err    error
 }
 
-// runCollect spawns this binary with args under a deadline and returns its output.
-// A non-zero exit is reported as rc, not as an error: every child signals failure
-// that way on purpose, and the caller parses stdout for the reason. err is non-nil
-// only when the process could not be started.
-func runCollect(args []string, timeout time.Duration) procOut {
+// runCollect spawns this binary as a child under a deadline and returns its stdout. The
+// child is identified by env alone and is passed no arguments.
+//
+// A non-zero exit is reported as rc, not as an error: every child signals failure that
+// way on purpose, and the caller parses stdout for the reason. err is non-nil only when
+// the process could not be started.
+func runCollect(env string, timeout time.Duration) procOut {
    if selfErr != nil {
       return procOut{rc: -1, err: selfErr}
    }
    ctx, cancel := context.WithTimeout(context.Background(), timeout)
    defer cancel()
 
-   cmd := exec.CommandContext(ctx, selfPath, args...)
-   var so, se bytes.Buffer
+   cmd := exec.CommandContext(ctx, selfPath)
+   cmd.Env = append(os.Environ(), env)
+   var so bytes.Buffer
    cmd.Stdout = &so
-   cmd.Stderr = &se
    runErr := cmd.Run()
 
-   p := procOut{stdout: so.Bytes(), stderr: se.Bytes(), rc: -1}
+   p := procOut{stdout: so.Bytes(), rc: -1}
    if ctx.Err() != nil {
-      p.timedOut = true
-      return p
+      return p // deadline hit: no verdict, and not a start failure either
    }
    switch e := runErr.(type) {
    case nil:

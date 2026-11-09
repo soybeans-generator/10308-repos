@@ -1,69 +1,55 @@
 // nibblemap.go begin
 //go:build windows
 
-// prkf -3: magic-independent stage 3 of the nibble chain, and the oracle it
-// measures with.
-// =============================================================================
-//
-// the decrypted image + the oracle licences -> one permutation per routine family
+// prkf -3: magic-independent stage 3 of the nibble chain, and the oracle it measures
+// with. The decrypted image plus the oracle licences become one permutation per
+// routine family.
 //
 // THE LIVE-SET TEST NEEDS ONE LICENCE. Forcing the table to a constant m makes the
-// derived scalar 32 bytes of 0x11*MAP[m], so the consumer's output depends on m
-// only through MAP[m]. A set the routine reads therefore yields 16 DISTINCT outputs
-// for one licence, while a set it never reads yields 16 identical ones. Sixteen
-// distinct is the test, and it costs 16 calls per set rather than the 48 a
-// three-licence sweep cost.
+// derived scalar 32 bytes of 0x11*MAP[m], so the consumer's output depends on m only
+// through MAP[m]. A set the routine reads yields 16 DISTINCT outputs for one licence;
+// a set it never reads yields 16 identical ones.
 //
-// THE PERMUTATION NEEDS FIFTEEN. On the live set, for every real nibble NN exactly
-// one forced m reaches the sentinel, and the sentinel output is the same 32 bytes
-// for every licence. So the value shared by all 15 licences is SENT XOR magic, and
-// magic is recovered rather than assumed.
+// THE PERMUTATION NEEDS FIFTEEN. On the live set, for every real nibble NN exactly one
+// forced m reaches the sentinel, and the sentinel output is the same 32 bytes for
+// every licence. So the value shared by all 15 licences is SENT XOR magic, and magic
+// is recovered rather than assumed.
 //
-// NO SAMPLE IS READ. Any 0x41 bytes drive the routine, because forcing the table
+// NO SAMPLE IS READ: any 0x41 bytes drive the routine, because forcing the table
 // collapses whatever it derives. Byte 0x40 is the family selector, so all three
-// families are swept and each live one is cached: a later sample may select any of
-// them.
+// families are swept and each live one is cached.
 //
-// ONE CHILD FOR ALL THREE FAMILIES. A child loads the module, reads the image and
-// patches the spans before its first probe; that fixed cost dwarfs the rest, so it
-// is paid once. The census comes from the profile, so this step never reads the DLL.
+// ONE CHILD FOR ALL THREE FAMILIES, because the module load, image read and span patch
+// that precede its first probe dwarf the rest. The census comes from the profile, so
+// this step never reads the DLL.
 //
-// OUTPUT IS HEX, ALWAYS. Every child row carries its 32-byte result with %x. The
-// driver splits rows on whitespace, so a raw-bytes %s would let a result containing
-// 0x20 corrupt the parse - and only for some values.
+// OUTPUT IS HEX, ALWAYS: a raw-bytes %s would let a result containing 0x20 corrupt the
+// driver's whitespace split, and only for some values.
 //
 // # THE ORACLE
 //
-// NOT A STEP. It used to be a flag of its own; it is now built here, on demand, when
-// testdata/oracle is absent. It reads neither base file, is derived from a fixed
-// sentinel and fixed scalars, and therefore never needs regenerating. `rm -rf
-// testdata/oracle` is the way to force a rebuild.
+// Not a step. It is built here on demand when testdata/oracle is absent. It reads
+// neither base file, is derived from a fixed sentinel and fixed scalars, and never
+// needs regenerating; `rm -rf testdata/oracle` forces a rebuild.
 //
 // For each key nibble N in 0x01..0x0f it writes key_NN.pub (the public key whose
 // private scalar has every nibble = N) and lic_NN.blob (an ECIES blob for that key
-// whose plaintext is "HELLO MICROSOFT!" || 0^16). Nibble 0x00 is skipped: scalar 0
-// is not a valid private key, and -3 recovers that entry as the leftover.
+// whose plaintext is "HELLO MICROSOFT!" || 0^16). Nibble 0x00 is skipped: scalar 0 is
+// not a valid private key, and -3 recovers that entry as the leftover.
 //
-// THE SCALAR IS NIBBLES, NOT BYTES. Forcing the table to M makes every NIBBLE of the
-// derived scalar M, so that scalar is 32 bytes of 0x11*M - not 32 bytes of 0x0M. The
-// oracle key has to match it exactly, or no forced value ever reproduces the key.
-//
-// key_NN.pub is DETERMINISTIC; lic_NN.blob is not, because it uses a random
-// ephemeral scalar. Validity is proven by -3 reaching a live set and -7 reaching
-// pubkey MATCH.
+// THE SCALAR IS NIBBLES, NOT BYTES: forcing the table to M makes every NIBBLE of the
+// derived scalar M, so that scalar is 32 bytes of 0x11*M.
 //
 // INPUTS   profilePath (census), imgPath, oracleDir/lic_NN.blob
 // OUTPUT   profilePath's map section, keyed by family; mapLogPath
-// USAGE    prkf -3. Internal child: prkf -3 sweep <descRVA> <families> <sets>
 package main
 
 import (
    "bytes"
-   "crypto/elliptic"
+   "crypto/ecdh"
    "crypto/rand"
    "encoding/hex"
    "fmt"
-   "math/big"
    "os"
    "path/filepath"
    "strconv"
@@ -76,73 +62,37 @@ import (
 // the oracle
 // =============================================================================
 
-var (
-   moParams = elliptic.P256().Params()
-   moN      = moParams.N
-   moP      = moParams.P
-)
-
-// buildOracle writes the 15 key+licence pairs into oracleDir.
-//
-// Called by -3 when the directory is missing. Its stdout goes straight to the
-// terminal and is not folded into derive_map.txt: the oracle build is a one-time
-// setup event, and interleaving its per-nibble table into the sweep log would bury
-// the sweep's own evidence.
+// buildOracle writes the 15 key+licence pairs into oracleDir. Called by -3 when the
+// directory is missing. Its stdout goes straight to the terminal and is not folded
+// into derive_map.txt: the build is a one-time setup event.
 func buildOracle() int {
-   out := oracleDir
-
-   // Every artefact this pipeline produces lives under outDir. Keeping the oracle
-   // beside the image it feeds means a run can never pick up a stale copy from the
-   // current directory by accident.
-   if err := os.MkdirAll(outDir, 0o755); err != nil {
-      return moFail("create %s: %v", outDir, err)
-   }
-
-   // --- sanity: the sentinel has to be an x-coordinate on the curve.
-   // The licence plaintext: signature key = "HELLO MICROSOFT!", content key =
-   // zeros. -3 recovers the magic sequence as the 32-byte output shared by every
-   // licence XOR these bytes, so the licence blob has to land exactly on them.
    sent := append([]byte("HELLO MICROSOFT!"), make([]byte, 16)...)
    if len(sent) != 32 {
       return moFail("sentinel is %d bytes, expected 32", len(sent))
    }
-   mx := new(big.Int).SetBytes(sent)
 
-   // y^2 = x^3 + a*x + b, with a = -3. P = 3 mod 4, so ModSqrt is the square root.
-   // SetBytes below is what proves the pair is really on the curve.
-   three := big.NewInt(3)
-   rhs := new(big.Int).Exp(mx, three, moP)
-   rhs.Sub(rhs, new(big.Int).Mul(three, mx))
-   rhs.Add(rhs, moParams.B)
-   rhs.Mod(rhs, moP)
-   my := new(big.Int).ModSqrt(rhs, moP)
-   if my == nil {
-      return moFail("'HELLO MICROSOFT!' || 0^16 is not an x-coordinate on P-256")
-   }
-   // canonical (even) root, so the Y in the log is stable across runs
-   if my.Bit(0) == 1 {
-      my.Sub(moP, my)
-   }
-
-   enc := make([]byte, 65)
-   enc[0] = 4
-   mx.FillBytes(enc[1:33])
-   my.FillBytes(enc[33:])
-   m, err := nistec.NewP256Point().SetBytes(enc)
+   // 0x02||X is the compressed SEC 1 form, and the 0x02 prefix asks for the even
+   // root, so the Y below is stable across runs. SetBytes is the whole check: it
+   // decompresses the point and rejects an X that is not on the curve.
+   m, err := nistec.NewP256Point().SetBytes(append([]byte{0x02}, sent...))
    if err != nil {
-      return moFail("sentinel point rejected by nistec: %v", err)
+      return moFail("'HELLO MICROSOFT!' || 0^16 is not an x-coordinate on P-256: %v", err)
    }
+   mb := m.Bytes() // 0x04 || X || Y
 
-   if err := os.MkdirAll(out, 0o755); err != nil {
-      return moFail("create %s: %v", out, err)
+   if err := os.MkdirAll(outDir, 0o755); err != nil {
+      return moFail("create %s: %v", outDir, err)
    }
-   if abs, err := filepath.Abs(out); err == nil {
+   if err := os.MkdirAll(oracleDir, 0o755); err != nil {
+      return moFail("create %s: %v", oracleDir, err)
+   }
+   if abs, err := filepath.Abs(oracleDir); err == nil {
       fmt.Printf("output    %s\n", abs)
    } else {
-      fmt.Printf("output    %s\n", out)
+      fmt.Printf("output    %s\n", oracleDir)
    }
-   fmt.Printf("sentinel  X = %064x\n", mx)
-   fmt.Printf("          Y = %064x\n", my)
+   fmt.Printf("sentinel  X = %x\n", mb[1:33])
+   fmt.Printf("          Y = %x\n", mb[33:])
    fmt.Printf("\n")
 
    // Distinct public keys are the oracle's whole output: a collision would silently
@@ -150,21 +100,17 @@ func buildOracle() int {
    pubs := make(map[string]bool)
 
    for nib := 1; nib < 16; nib++ {
-      // The oracle private scalar: nibble NN repeated 64 times, which is 32 bytes
-      // of 0x11*NN. Not 32 bytes of 0x0N: the forced table makes every NIBBLE of
-      // the derived scalar equal to the forced value, so a byte is two of them.
-      raw := new(big.Int).SetBytes(bytes.Repeat([]byte{byte(nib * 0x11)}, 32))
-      k := new(big.Int).Mod(raw, moN)
-      if k.Sign() == 0 {
-         return moFail("nibble %02x reduces to a zero scalar", nib)
-      }
+      // The private scalar: nibble NN repeated 64 times, which is 32 bytes of
+      // 0x11*NN. No reduction is possible or needed: the largest, 0x0f, is
+      // (2^256-1)/17, below N, so all fifteen are already valid scalars.
+      k := bytes.Repeat([]byte{byte(nib * 0x11)}, 32)
 
-      q, err := nistec.NewP256Point().ScalarBaseMult(moScalar(k))
+      q, err := nistec.NewP256Point().ScalarBaseMult(k)
       if err != nil {
          return moFail("nibble %02x: ScalarBaseMult: %v", nib, err)
       }
 
-      // --- key file: X||Y, no 0x04 prefix, exactly what .sig.pub/.enc.pub use
+      // key file: X||Y, no 0x04 prefix, exactly what .sig.pub/.enc.pub use
       pub, err := moXY(nib, "public key", q)
       if err != nil {
          return moFail("%v", err)
@@ -173,22 +119,22 @@ func buildOracle() int {
          return moFail("nibble %02x duplicates an earlier public key", nib)
       }
       pubs[string(pub)] = true
-      if err := os.WriteFile(filepath.Join(out, fmt.Sprintf("key_%02x.pub", nib)), pub, 0o644); err != nil {
+      if err := os.WriteFile(filepath.Join(oracleDir, fmt.Sprintf("key_%02x.pub", nib)), pub, 0o644); err != nil {
          return moFail("write key_%02x.pub: %v", nib, err)
       }
 
-      // --- licence blob: ECIES  C1 = r*G,  C2 = M + r*Q
-      // Decryption with scalar k gives C2 - k*C1 = M, so the plaintext point's
-      // X-coordinate is the sentinel and the routine's output is SENT XOR magic.
+      // licence blob: ECIES  C1 = r*G,  C2 = M + r*Q. Decryption with scalar k gives
+      // C2 - k*C1 = M, so the plaintext point's X-coordinate is the sentinel and the
+      // routine's output is SENT XOR magic.
       r, err := moRandScalar()
       if err != nil {
          return moFail("%v", err)
       }
-      c1, err := nistec.NewP256Point().ScalarBaseMult(moScalar(r))
+      c1, err := nistec.NewP256Point().ScalarBaseMult(r)
       if err != nil {
          return moFail("nibble %02x: C1 = r*G: %v", nib, err)
       }
-      rq, err := nistec.NewP256Point().ScalarMult(q, moScalar(r))
+      rq, err := nistec.NewP256Point().ScalarMult(q, r)
       if err != nil {
          return moFail("nibble %02x: r*Q: %v", nib, err)
       }
@@ -206,30 +152,23 @@ func buildOracle() int {
       if len(blob) != 0x80 {
          return moFail("nibble %02x: blob is %d bytes", nib, len(blob))
       }
-      if err := os.WriteFile(filepath.Join(out, fmt.Sprintf("lic_%02x.blob", nib)), blob, 0o644); err != nil {
+      if err := os.WriteFile(filepath.Join(oracleDir, fmt.Sprintf("lic_%02x.blob", nib)), blob, 0o644); err != nil {
          return moFail("write lic_%02x.blob: %v", nib, err)
       }
 
-      // --- round-trip: C2 - k*C1 must be the sentinel point. The routine uses the
-      // unreduced scalar, which is congruent to k mod N, so this check covers what
-      // the routine will actually compute even for nibble 0x0f.
-      negK := new(big.Int).Sub(moN, k)
-      kc1, err := nistec.NewP256Point().ScalarMult(c1, moScalar(negK))
+      // Round-trip: k*C1 + M must be C2, which is C2 - k*C1 = M written without a
+      // negation. k is the unreduced scalar the routine will actually compute.
+      kc1, err := nistec.NewP256Point().ScalarMult(c1, k)
       if err != nil {
-         return moFail("nibble %02x: -k*C1: %v", nib, err)
+         return moFail("nibble %02x: k*C1: %v", nib, err)
       }
-      rec := nistec.NewP256Point().Add(c2, kc1)
-      if !bytes.Equal(rec.Bytes(), m.Bytes()) {
+      if rec := nistec.NewP256Point().Add(kc1, m); !bytes.Equal(rec.Bytes(), c2.Bytes()) {
          return moFail("nibble %02x: round-trip did not recover the sentinel point", nib)
       }
 
-      note := ""
-      if raw.Cmp(moN) >= 0 {
-         note = "  (scalar 2^256-1 > N, reduced; nibbles still all 0f)"
-      }
-      fmt.Printf("%02x  d = %064x%s\n", nib, k, note)
-      fmt.Printf("    X %064x\n", pub[:32])
-      fmt.Printf("    Y %064x\n", pub[32:])
+      fmt.Printf("%02x  d = %x\n", nib, k)
+      fmt.Printf("    X %x\n", pub[:32])
+      fmt.Printf("    Y %x\n", pub[32:])
       fmt.Printf("    key 0x40 bytes  blob 0x80 bytes  round-trip OK\n")
    }
 
@@ -237,13 +176,13 @@ func buildOracle() int {
       return moFail("only %d distinct public keys, expected 15", len(pubs))
    }
 
-   fmt.Printf("\ngenerated %d/15 key+licence pairs in %s\n", len(pubs), out)
+   fmt.Printf("\ngenerated %d/15 key+licence pairs in %s\n", len(pubs), oracleDir)
    fmt.Printf("key_NN.pub is deterministic; lic_NN.blob is not (random ephemeral scalar).\n")
    return 0
 }
 
-// dmDeriveMap is the driver. The log is written by the deferred flush below, not by
-// each failure path, so no return - and no panic - can leave it unwritten.
+// dmDeriveMap is the driver. The log is written by the deferred flush, so no return
+// can leave it unwritten.
 func dmDeriveMap() (code int) {
    var lines []string
    logf := func(f string, a ...any) {
@@ -265,14 +204,12 @@ func dmDeriveMap() (code int) {
    }()
 
    // The census and the image come from the profile, so this step never reads the
-   // DLL: scanDescs already ran in -2, and its result is what makes -3 cheap.
+   // DLL: scanDescs already ran in -2.
    pi, err := pfPrep()
    if err != nil {
       return fail("%v", err)
    }
 
-   // The oracle is a precondition, not a step: build it here rather than making the
-   // user remember a flag.
    if _, err := os.Stat(oracleDir); err != nil {
       logf("oracle %s is missing - building it (one time, ever)", oracleDir)
       if oc := buildOracle(); oc != 0 {
@@ -303,10 +240,9 @@ func dmDeriveMap() (code int) {
    logf("consumer descriptor 0x%06x  site 0x%x", h.descVA, site)
    logf("")
 
-   // ---- one child, three families -----------------------------------------
-   // The child decides which set is live (16 distinct outputs for one licence) and
-   // then sweeps that set over 15 licences. Nothing about that decision needs the
-   // driver, so the whole sweep is one process and one image patch.
+   // The child decides which set is live and then sweeps it over 15 licences. Nothing
+   // about that decision needs the driver, so the whole sweep is one process and one
+   // image patch.
    logf("sweeping 3 families in one child")
    logf("")
 
@@ -389,8 +325,8 @@ func dmDeriveMap() (code int) {
    logf("families with a permutation: %v", live)
    logf("")
 
-   // pfLoad, not pfNew: -3 fills in one section and must not disturb the stage
-   // pairings -4 may already have written.
+   // pfLoad, not a fresh profile: -3 fills in one section and must not disturb a
+   // stage pairing -6 may already have written.
    p := pfLoad(pi.sha)
    p.SizeOfImage = pi.size
    p.Map = pmaps
@@ -401,8 +337,8 @@ func dmDeriveMap() (code int) {
    return 0
 }
 
-// dmFindSets finds every run of bytes <= 0x0f long enough to hold a bijection set,
-// and within each run every offset where 64 consecutive 16-byte rows are each a
+// dmFindSets finds every run of bytes <= 0x0f long enough to hold a bijection set, and
+// within each run every offset where 64 consecutive 16-byte rows are each a
 // permutation of 0..15.
 func dmFindSets(img []byte) []uint32 {
    const (
@@ -438,8 +374,8 @@ func dmFindSets(img []byte) []uint32 {
 }
 
 // dmHx parses a hex constant. A malformed constant is a programming error, and
-// silently returning nil would make the Windows 10/11 comparisons false for the
-// wrong reason, so it panics at the comparison site instead.
+// silently returning nil would make the Windows 10/11 comparisons false for the wrong
+// reason, so it panics at the comparison site.
 func dmHx(s string) []byte {
    b, err := hex.DecodeString(s)
    if err != nil {
@@ -450,8 +386,8 @@ func dmHx(s string) []byte {
 
 // dmPerm builds one family's permutation from a completed sweep. The value every
 // licence agrees on is the sentinel output, SENT XOR magic; the forced nibble that
-// produced it is the pre-image of that licence's real nibble, so reading the hits
-// out in licence order gives MAP inverted, which is what stage 4 wants.
+// produced it is the pre-image of that licence's real nibble, so reading the hits out
+// in licence order gives MAP inverted, which is what stage 4 wants.
 func dmPerm(fm *dmFam) (map[int]int, string, error) {
    if len(fm.outs) < 15 {
       return nil, "", fmt.Errorf("sweep incomplete (%d of 15 licences)", len(fm.outs))
@@ -520,38 +456,25 @@ func dmUniq(b []byte) bool {
    return true
 }
 
-// moFail reports a fatal condition on stderr and yields exit code 1. It returns the
-// code rather than exiting so buildOracle has one exit point.
+// moFail reports a fatal condition on stderr and yields exit code 1.
 func moFail(format string, args ...any) int {
    fmt.Fprintf(os.Stderr, "FATAL: "+format+"\n", args...)
    return 1
 }
 
-// moRandScalar draws a uniform non-zero scalar mod N.
-func moRandScalar() (*big.Int, error) {
-   for {
-      k, err := rand.Int(rand.Reader, moN)
-      if err != nil {
-         return nil, fmt.Errorf("read random: %w", err)
-      }
-      if k.Sign() != 0 {
-         return k, nil
-      }
+// moRandScalar draws a uniform non-zero scalar mod N. crypto/ecdh owns that
+// distribution, so neither the retry loop nor the zero test is repeated here.
+func moRandScalar() ([]byte, error) {
+   k, err := ecdh.P256().GenerateKey(rand.Reader)
+   if err != nil {
+      return nil, fmt.Errorf("generate ephemeral scalar: %w", err)
    }
-}
-
-// moScalar renders v as the 32-byte big-endian scalar nistec expects. FillBytes
-// rather than Bytes: a scalar with leading zero bytes is still 32 bytes long, and
-// the point routines want a fixed-width input.
-func moScalar(v *big.Int) []byte {
-   b := make([]byte, 32)
-   v.FillBytes(b)
-   return b
+   return k.Bytes(), nil
 }
 
 // moXY returns a point as X||Y, the 64-byte form every PlayReady key file uses. An
-// infinity result - possible only if a sum cancels - has no 65-byte encoding and is
-// an error here rather than silently written as 64 zero bytes.
+// infinity result has no 65-byte encoding and is an error here rather than silently
+// written as 64 zero bytes.
 func moXY(nib int, what string, p *nistec.P256Point) ([]byte, error) {
    b := p.Bytes()
    if len(b) != 65 || b[0] != 4 {
@@ -560,29 +483,11 @@ func moXY(nib int, what string, p *nistec.P256Point) ([]byte, error) {
    return b[1:], nil
 }
 
-// --- stage entry point ------------------------------------------------------
-
-func stageDeriveMap(args []string) int {
-   if len(args) > 0 {
-      if args[0] != "sweep" {
-         fmt.Fprintf(os.Stderr, "prkf -3: unexpected argument %q\n", args[0])
-         return 2
-      }
-      if len(args) != 4 {
-         fmt.Fprintln(os.Stderr, "usage: prkf -3 sweep <descRVA> <families> <sets>")
-         return 2
-      }
-      return dmWorker(args[1], args[2], args[3])
-   }
-   return dmDeriveMap()
-}
-
 // dmFindConsumer returns the heap-exec descriptor owning the unique size-check site
 // and the site itself, so the driver does not look it up a second time.
 func dmFindConsumer(img []byte, heaps []imgDesc) (imgDesc, int, bool) {
-   pat := []byte{0x83, 0x79, 0x14, 0x41} // cmp [rcx+0x14],0x41
-   site := bytes.Index(img, pat)
-   if site < 0 || bytes.Count(img, pat) != 1 {
+   site := bytes.Index(img, dpPattern)
+   if site < 0 || bytes.Count(img, dpPattern) != 1 {
       return imgDesc{}, site, false
    }
    for _, h := range heaps {

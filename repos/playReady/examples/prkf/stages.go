@@ -1,50 +1,43 @@
 // stages.go begin
 //go:build windows
 
-// prkf -4's search: walk the code graph outward from the key consumer, then try
-// every ordered (stage 1, stage 2) pair until the sample's public key comes back.
+// -6's search: walk the code graph outward from the key consumer, then try every
+// ordered (stage 1, stage 2) pair until the sample's public key comes back.
 //
 //   stage 1  key half  --stage-1 routine-->  OBF
 //   stage 2  OBF       --stage-2 routine-->  mut
 //   stage 3  mut   --64 per-nibble bijection subtables-->  mapped
 //   stage 4  mapped --16-entry permutation-->  plain
 //
-// # EACH FAMILY HAS ITS OWN CHAIN
-//
-// key[0x40] % 3 selects one of three routine families: a different bijection table
-// AND different stage routines. A pairing found with one family's sample does not
-// apply to another, so the caller records only its own family's result.
-//
 // # ONE CHILD PER CANDIDATE
 //
-// These are arbitrary code blobs called with arbitrary inputs, and some write
-// outside the buffers they are handed. A child that tried forty combinations
-// produced a match a single call could not reproduce, so every candidate gets its
-// own process. A child is cheap because -2 caches the descriptor census: no DLL
-// read, no scan, just the image and the patch.
+// These are arbitrary code blobs called with arbitrary inputs, and some write outside
+// the buffers they are handed. A child that tried forty combinations produced a match a
+// single call could not reproduce, so every candidate gets its own process. A child is
+// cheap because -2 caches the descriptor census: no DLL read, no scan, just the image
+// and the patch.
 //
 // # THE SEARCH IS EXHAUSTIVE OVER WHAT CAN VARIATE
 //
 // Both stages share one candidate set and every ordered pair is tried. op=3 gets a
 // 0x20-byte key and two 0x20-byte buffers, and which buffer a routine writes is not
-// stated anywhere, so every trial reports both and the parent tries each. The
-// winner is recorded - S1, S2, K1, O1, K2, O2 - and the apply path replays it.
+// stated anywhere, so every trial reports both and the parent tries each. The winner is
+// recorded - S1, S2, K1, O1, K2, O2 - and the apply path replays it.
 //
 // # THE WALK MATCHES BOTH ADDRESSES
 //
-// A lea/call target names either a descriptor's own address (what op=3 is handed)
-// or its descVA (what the kernel executes, so what a call inside the image
-// targets). Indexing only one of them misses the real stages whenever they differ.
+// A lea/call target names either a descriptor's own address (what op=3 is handed) or its
+// descVA (what the kernel executes, so what a call inside the image targets). Indexing
+// only one of them misses the real stages whenever they differ.
 //
-// The caps bound the walk. On the recorded build the two stages sit inside the
-// first seven hops, which reaches 22 candidates; exhausting the call graph reaches
-// hundreds of descriptors and buries them in noise. Hitting a cap is reported as
-// TRUNCATED, never hidden.
+// The caps bound the walk. On the recorded build the two stages sit inside the first
+// seven hops. Hitting a cap is reported as TRUNCATED.
 //
-// USAGE  prkf -4 discovers and caches. Children, positional:
+// USAGE  prkf -6 discovers, caches and applies. Its children are selected by trialEnv
+// and take no arguments (see childMode in child.go):
 //
-//   -4 p1 <desc>...                     every descriptor as stage 1, both halves
-//   -4 p2 <start> <obf,...> <desc,...>  every pair as stage 2, both halves
+//   p1;<desc>,...                      every descriptor as stage 1, both halves
+//   p2;<start>;<obf>,...;<desc>,...    every pair as stage 2, both halves
 package main
 
 import (
@@ -58,11 +51,13 @@ import (
    "time"
 )
 
-// dpPattern is the only package-level value in this file: the size-check signature
-// is read in three places here and nowhere else.
+// dpPattern is the size-check signature: the consumer's own test, and the anchor both
+// the walk here and -3's census of the consumer are built on.
 var dpPattern = []byte{0x83, 0x79, 0x14, 0x41} // cmp dword ptr [rcx+0x14], 0x41
 
-// dpDescList parses a list of descriptor addresses, each in any base.
+// dpDescList parses a list of descriptor addresses, each in any base. The child
+// payloads are built from the same formatting, so this is also what validates them on
+// the way back in.
 func dpDescList(xs []string) ([]uint32, bool) {
    out := make([]uint32, 0, len(xs))
    for _, x := range xs {
@@ -73,6 +68,46 @@ func dpDescList(xs []string) ([]uint32, bool) {
       out = append(out, uint32(v))
    }
    return out, len(out) > 0
+}
+
+// --- stage entry point ------------------------------------------------------
+
+// dpTrialChild dispatches the two trial modes. spec is the value of trialEnv,
+// ';'-separated, and its stdout is parsed by the parent, so a malformed spec is exit
+// code 2 with the shape on stderr.
+func dpTrialChild(spec string) int {
+   f := strings.Split(spec, ";")
+   switch f[0] {
+   case "p1":
+      if len(f) != 2 {
+         fmt.Fprintln(os.Stderr, "prkf: "+trialEnv+": want p1;<desc>,...")
+         return 2
+      }
+      descs, ok := dpDescList(strings.Split(f[1], ","))
+      if !ok {
+         fmt.Fprintln(os.Stderr, "prkf: "+trialEnv+": bad descriptor list")
+         return 2
+      }
+      return dpWorkerP1(descs)
+   case "p2":
+      if len(f) != 4 {
+         fmt.Fprintln(os.Stderr, "prkf: "+trialEnv+": want p2;<start>;<obf>,...;<desc>,...")
+         return 2
+      }
+      start, err := strconv.Atoi(f[1])
+      if err != nil || start < 0 {
+         fmt.Fprintf(os.Stderr, "prkf: "+trialEnv+": bad start %q\n", f[1])
+         return 2
+      }
+      descs, ok := dpDescList(strings.Split(f[3], ","))
+      if !ok {
+         fmt.Fprintln(os.Stderr, "prkf: "+trialEnv+": bad descriptor list")
+         return 2
+      }
+      return dpWorkerP2(start, strings.Split(f[2], ","), descs)
+   }
+   fmt.Fprintf(os.Stderr, "prkf: "+trialEnv+": unknown mode %q\n", f[0])
+   return 2
 }
 
 // isZeroHex reports whether a hex field is absent or all zero bytes. A stage that
@@ -90,46 +125,9 @@ func isZeroHex(s string) bool {
    return true
 }
 
-// --- stage entry point ------------------------------------------------------
-
-// stageFindStages is -4's entry point. It owns the trial children, because -4 is
-// where the stage machinery lives; -7 spawns the same children rather than
-// duplicating them.
-func stageFindStages(args []string) int {
-   if len(args) == 0 {
-      return dpDerive(true)
-   }
-   switch args[0] {
-   case "p1":
-      descs, ok := dpDescList(args[1:])
-      if !ok {
-         fmt.Fprintln(os.Stderr, "usage: prkf -4 p1 <desc>...")
-         return 2
-      }
-      return dpWorkerP1(descs)
-   case "p2":
-      if len(args) < 4 {
-         fmt.Fprintln(os.Stderr, "usage: prkf -4 p2 <start> <obf,...> <desc,...>")
-         return 2
-      }
-      start, err := strconv.Atoi(args[1])
-      if err != nil || start < 0 {
-         fmt.Fprintf(os.Stderr, "prkf -4: bad start %q\n", args[1])
-         return 2
-      }
-      descs, ok := dpDescList(strings.Split(args[3], ","))
-      if !ok {
-         fmt.Fprintln(os.Stderr, "prkf -4: bad descriptor list")
-         return 2
-      }
-      return dpWorkerP2(start, strings.Split(args[2], ","), descs)
-   }
-   fmt.Fprintf(os.Stderr, "prkf -4: unexpected argument %q\n", args[0])
-   return 2
-}
-
-// dpFindStages is the search. It returns one confirmed pairing and writes nothing:
-// the caller caches it.
+// dpFindStages is the search. It returns one confirmed pairing and writes nothing: the
+// caller caches it. The public key to verify against arrives as an argument rather than
+// being read here, so the function has one input it cannot get wrong.
 func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) (*profileStages, error) {
    const (
       tol     = 0x20 // a lea/call target this close to a descriptor is that descriptor
@@ -139,12 +137,12 @@ func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) 
    )
 
    ov := 0
-   for _, s := range in.seg {
+   for _, s := range in.spans {
       if len(carveRuns(in.merged, s.rva, s.size)) != 1 {
          ov++
       }
    }
-   say("spans intersecting heap-exec blocks: %d of %d", ov, len(in.seg))
+   say("spans intersecting heap-exec blocks: %d of %d", ov, len(in.spans))
    say("")
 
    blockOf := func(rva int) (imgDesc, bool) {
@@ -262,9 +260,6 @@ func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) 
    }
 
    // ---- phase 1: every candidate as stage 1, one child each ----------------
-   // One child per candidate, because these are arbitrary code blobs: a routine
-   // that writes outside its buffers would otherwise corrupt the image for every
-   // candidate called after it in the same process.
    say("phase 1: %d candidates x 2 key halves, one child each", len(candList))
 
    var obfs []dpObf
@@ -300,7 +295,7 @@ func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) 
    }
 
    // Deduplicate by value: two candidates producing the same bytes are
-   // indistinguishable downstream, and trying both doubles the work for nothing.
+   // indistinguishable downstream.
    var obfList []dpObf
    seenv := map[string]bool{}
    for _, o := range obfs {
@@ -354,7 +349,7 @@ func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) 
                continue
             }
             plain, ok := dpChain(in.img, in.cluster[fam], in.mapt[fam], mut)
-            if !ok || !bytes.Equal(dpScalarPub(plain), want) {
+            if !ok || !pubMatches(plain, want) {
                continue
             }
             o := obfList[m.i/2]
@@ -374,12 +369,11 @@ func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) 
          continue
       }
 
-      // Confirm through the exact path -7 will use. A child can produce a match a
-      // single call cannot reproduce - a sibling candidate may have corrupted the
-      // image - and a pairing that cannot be applied is not a pairing.
+      // Confirm through the exact path -6 will use: a child can produce a match a single
+      // call cannot reproduce, and a pairing that cannot be applied is not a pairing.
       say("  0x%06x candidate match, confirming", d2)
       plain, err := dpApply(in, fam, st, say)
-      if err != nil || !bytes.Equal(dpScalarPub(plain), want) {
+      if err != nil || !pubMatches(plain, want) {
          say("  not reproducible - continuing")
          say("")
          continue
@@ -408,20 +402,21 @@ func dpFindStages(in *dpInputs, fam int, want []byte, say func(string, ...any)) 
    return nil, fmt.Errorf("no (stage 1, stage 2) pairing reproduced %s", encPubPath)
 }
 
-// dpBatch is one trial child, parsed.
+// dpBatch is one trial child, parsed: its rows, or the reason it produced none.
 type dpBatch struct {
    res      []dpRow
-   fault    string
    loadfail string
-   rc       int
 }
 
 // dpParse turns a trial child's stdout into rows. Both phases print the same shape:
 //
 //   RES <i> <half> <a> <b>      one 0x20-byte buffer per field, hex
 //   RES <i> <half> REJECT rc=.. st=..
+//
+// Only lines carrying the phase prefix are read, which is also why a FAULT line -
+// printed unprefixed, by the child's own handler - is not a row.
 func dpParse(p procOut, pre string) dpBatch {
-   r := dpBatch{rc: p.rc}
+   var r dpBatch
    if p.err != nil {
       r.loadfail = "LOADFAIL " + p.err.Error()
       return r
@@ -436,8 +431,6 @@ func dpParse(p procOut, pre string) dpBatch {
          continue
       }
       switch f[0] {
-      case "FAULT":
-         r.fault = x
       case "LOADFAIL":
          r.loadfail = x
       case "RES":
@@ -467,11 +460,11 @@ func dpParse(p procOut, pre string) dpBatch {
 
 // dpRunP1 spawns one stage-1 probe child and parses its rows.
 func dpRunP1(descs []uint32) dpBatch {
-   args := []string{"-4", "p1"}
-   for _, d := range descs {
-      args = append(args, fmt.Sprintf("0x%x", d))
+   ds := make([]string, len(descs))
+   for i, d := range descs {
+      ds[i] = fmt.Sprintf("0x%x", d)
    }
-   return dpParse(runCollect(args, 300*time.Second), "S1 ")
+   return dpParse(runCollect(trialEnv+"=p1;"+strings.Join(ds, ","), 300*time.Second), "S1 ")
 }
 
 // dpRunP2 spawns one stage-2 probe child and parses its rows.
@@ -484,15 +477,15 @@ func dpRunP2(start int, obfs []dpObf, descs []uint32) dpBatch {
    for i, d := range descs {
       ds[i] = fmt.Sprintf("0x%x", d)
    }
-   args := []string{
-      "-4", "p2", strconv.Itoa(start),
+   spec := strings.Join([]string{
+      "p2", strconv.Itoa(start),
       strings.Join(os, ","), strings.Join(ds, ","),
-   }
-   return dpParse(runCollect(args, 300*time.Second), "MX ")
+   }, ";")
+   return dpParse(runCollect(trialEnv+"="+spec, 300*time.Second), "MX ")
 }
 
-// dpObf is one stage-1 output: the candidate, key half and buffer that produced it,
-// and the 0x20-byte value.
+// dpObf is one stage-1 output: the candidate, key half and buffer that produced it, and
+// the 0x20-byte value.
 type dpObf struct {
    d1 uint32
    h  int // key half stage 1 was given
@@ -500,9 +493,8 @@ type dpObf struct {
    v  string
 }
 
-// dpRow is one row from a trial child. a and b are the two 0x20-byte buffers in
-// call order: for a stage-1 row that is out then key, for a stage-2 row key then
-// out.
+// dpRow is one row from a trial child. a and b are the two 0x20-byte buffers in call
+// order: for a stage-1 row that is out then key, for a stage-2 row key then out.
 type dpRow struct {
    i    int
    h    int
