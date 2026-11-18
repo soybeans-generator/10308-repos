@@ -1,17 +1,53 @@
+// 0.go marker preserve
 package amazon
 
 import (
    "bytes"
    "encoding/json"
+   "errors"
    "fmt"
    "io"
    "net/http"
    "net/url"
    "strings"
-   "time"
 )
 
-const HostATVPS = "https://atv-ps.amazon.com"
+const (
+   AppName         = "AIV"
+   AppVersion      = "3.12.0"
+   DeviceModel     = "sdk_gphone_x86"
+   OSVersion       = "Android"
+   SoftwareVersion = "999"
+   DeviceDomain    = "Device"
+)
+
+const HostAmazonAPI = "https://api.amazon.com"
+
+const detailsATFClientFeatures = "ShowPSEWarning,EnableBuyBoxV2," +
+   "EnableRecordingExperience,EnableDetailsRecordButton,EnableBuyBoxActionsV2," +
+   "EnableBuyBoxActionsV3,EnableOutOfStreamSponsorship,EnableBuyBoxActionsV4," +
+   "EnableCommonSenseMedia,EnableMapsTelemetryPassthrough," +
+   "EnableSterlingSponsorship,EnableConsentPopUp"
+
+// dynamicFeatures "DetailsAtf" is what asks the server to populate the
+// above-the-fold section. Without it primaryActions comes back empty and there
+// is no playback envelope anywhere in the response.
+const detailsATFDynamicFeatures = "CLIENT_DECORATION_ENABLE_DAAPI,DetailsAtf,RecordingCardSupported"
+
+// detailsATFRoles mirrors the roles the Android TV client sends for the
+// details page. "playback-envelope-supported" is the one that matters here; the
+// rest keep the offer cards accurate.
+const detailsATFRoles = "live-supported,startover-supported,linear-supported," +
+   "prime-offer-supported,multipart-notification-supported,tvod-supported," +
+   "svod-supported,supports-dai-timeshifting,supports-rapid-recap," +
+   "playback-envelope-supported,linear-playback-envelope-supported," +
+   "prime-benefit-activation-supported,supports-stream-sampler-vod," +
+   "supports-in-player-multi-offer,supports-in-player-full-content-sampler," +
+   "supports-stream-selector-modal,av-liveliness-with-unavailable-message-supported," +
+   "new-title-badge-supported,coming-soon-title-badge-supported," +
+   "supports-consent-redirection,supports-trailer,psft-supported," +
+   "supports-in-player-go-ad-free,supports-plan-selection," +
+   "sponsored-promotion-slot-supported"
 
 // the wrong DTID will fail the license request. if you change the DTID you
 // need to relog. also if you get a failed license request try provision again.
@@ -46,98 +82,8 @@ var Devices = []Device{
    },
 }
 
-// types.go marker preserve
-// GetPlayReadyLicense fetches the PlayReady DRM license for the given title.
-func GetPlayReadyLicense(actorToken *ActorToken, metadata *PlaybackExperienceMetadata, licenseChallenge []byte, deviceTypeID string) ([]byte, error) {
-   return fetchDRMLicense("/playback/drm-vod/GetPlayReadyLicense", actorToken, metadata, licenseChallenge, deviceTypeID)
-}
-
-// GetWidevineLicense requests a Widevine DRM license from the Amazon endpoint.
-func GetWidevineLicense(actorToken *ActorToken, metadata *PlaybackExperienceMetadata, licenseChallenge []byte, deviceTypeID string) ([]byte, error) {
-   return fetchDRMLicense("/playback/drm-vod/GetWidevineLicense", actorToken, metadata, licenseChallenge, deviceTypeID)
-}
-
-// fetchDRMLicense is the shared base function for making DRM requests
-func fetchDRMLicense(path string, actorToken *ActorToken, metadata *PlaybackExperienceMetadata, licenseChallenge []byte, deviceTypeID string) ([]byte, error) {
-   payload := map[string]any{
-      "playbackEnvelope": metadata.PlaybackEnvelope,
-      "licenseChallenge": licenseChallenge,
-   }
-
-   body, err := json.Marshal(payload)
-   if err != nil {
-      return nil, fmt.Errorf("failed to marshal payload: %w", err)
-   }
-
-   req, err := http.NewRequest(http.MethodPost, HostATVPS+path, bytes.NewReader(body))
-   if err != nil {
-      return nil, fmt.Errorf("failed to create request: %w", err)
-   }
-
-   query := url.Values{}
-   query.Set("deviceTypeID", deviceTypeID)
-   query.Set("deviceID", DeviceID)
-
-   req.URL.RawQuery = query.Encode()
-   req.Header.Set("Authorization", "Bearer "+actorToken.Token)
-
-   resp, err := doRequest(req)
-   if err != nil {
-      return nil, fmt.Errorf("request failed: %w", err)
-   }
-   defer resp.Body.Close()
-
-   // Read the body once so we can attempt multiple unmarshals
-   respBytes, err := io.ReadAll(resp.Body)
-   if err != nil {
-      return nil, fmt.Errorf("failed to read response: %w", err)
-   }
-
-   // 1. Try the standard response format (contains licenses or a nested error object)
-   var standardResp struct {
-      WidevineLicense *struct {
-         License []byte `json:"license"`
-      } `json:"widevineLicense"`
-      PlayReadyLicense *struct {
-         License []byte `json:"license"`
-      } `json:"playReadyLicense"`
-      Message *struct {
-         Body *struct {
-            Code    string `json:"code"`
-            Message string `json:"message"`
-         } `json:"body"`
-      } `json:"message"`
-   }
-
-   if err := json.Unmarshal(respBytes, &standardResp); err == nil {
-      if standardResp.Message != nil && standardResp.Message.Body != nil {
-         return nil, fmt.Errorf("API error [%s]: %s", standardResp.Message.Body.Code, standardResp.Message.Body.Message)
-      }
-      if standardResp.WidevineLicense != nil && len(standardResp.WidevineLicense.License) > 0 {
-         return standardResp.WidevineLicense.License, nil
-      }
-      if standardResp.PlayReadyLicense != nil && len(standardResp.PlayReadyLicense.License) > 0 {
-         return standardResp.PlayReadyLicense.License, nil
-      }
-   }
-
-   // 2. If the first unmarshal fails (e.g., "message" is a string causing a type error), try the flat error format
-   var flatErrorResp struct {
-      Code    string `json:"code"`
-      ID      string `json:"id"`
-      Message string `json:"message"`
-   }
-
-   if err := json.Unmarshal(respBytes, &flatErrorResp); err == nil && flatErrorResp.Message != "" {
-      return nil, fmt.Errorf("code: %s, message: %s, id: %s", flatErrorResp.Code, flatErrorResp.Message, flatErrorResp.ID)
-   }
-
-   // 3. Check for standard HTTP errors if no JSON error message was extracted
-   if resp.StatusCode != http.StatusOK {
-      return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-   }
-
-   return nil, fmt.Errorf("license not found in response")
+func deviceName() string {
+   return fmt.Sprintf("%%FIRST_NAME%%'s%%DUPE_STRATEGY_1st%% %s", DeviceModel)
 }
 
 func trimURLPath(rawUrl string) (*url.URL, error) {
@@ -159,17 +105,20 @@ func trimURLPath(rawUrl string) (*url.URL, error) {
    return parsedURL, nil
 }
 
-// ActorToken represents an actor-specific access token.
-type ActorToken struct {
-   Token string `json:"token"`
-}
-
 // playback.go marker preserve
 // GetActorToken exchanges the account refresh token and actor ID for an actor-specific access token.
 func GetActorToken(tokens *TokenPair, profile *Profile, deviceTypeID string) (*ActorToken, error) {
    payload := map[string]any{
       "actor_id":             profile.ProfileID,
-      "app_name":             "AIV",
+      "domain":               DeviceDomain,
+      "device_name":          deviceName(),
+      "app_name":             AppName,
+      "app_version":          AppVersion,
+      "device_model":         DeviceModel,
+      "os_version":           OSVersion,
+      "device_type":          deviceTypeID,
+      "device_serial":        DeviceID,
+      "software_version":     SoftwareVersion,
       "requested_token_type": "actor_access_token",
       "source_token_type":    "refresh_token",
       "source_device_tokens": []any{
@@ -222,8 +171,104 @@ func GetActorToken(tokens *TokenPair, profile *Profile, deviceTypeID string) (*A
    return &token, nil
 }
 
-func (*ActorToken) CachePath() string {
-   return "rosso/amazon/ActorToken"
+// findPlaybackExperienceMetadata walks an arbitrary decoded JSON value looking
+// for a playbackExperienceMetadata object that carries a non-empty envelope.
+func findPlaybackExperienceMetadata(v any) *PlaybackExperienceMetadata {
+   switch node := v.(type) {
+   case map[string]any:
+      if raw, ok := node["playbackExperienceMetadata"]; ok {
+         if obj, ok := raw.(map[string]any); ok {
+            b, err := json.Marshal(obj)
+            if err == nil {
+               var pem PlaybackExperienceMetadata
+               if json.Unmarshal(b, &pem) == nil && pem.PlaybackEnvelope != "" {
+                  return &pem
+               }
+            }
+         }
+      }
+      for _, child := range node {
+         if pem := findPlaybackExperienceMetadata(child); pem != nil {
+            return pem
+         }
+      }
+   case []any:
+      for _, child := range node {
+         if pem := findPlaybackExperienceMetadata(child); pem != nil {
+            return pem
+         }
+      }
+   }
+   return nil
+}
+
+// CodePair represents the public and private codes used for device linking.
+type CodePair struct {
+   PublicCode  string `json:"public_code"`
+   PrivateCode string `json:"private_code"`
+}
+
+// CreateCodePair requests a public and private code pair for device linking.
+func CreateCodePair(deviceTypeID string) (*CodePair, error) {
+   if deviceTypeID == "" {
+      return nil, errors.New("deviceTypeID cannot be empty")
+   }
+
+   payload := map[string]any{
+      "code_data": map[string]string{
+         "domain":           DeviceDomain,
+         "device_name":      deviceName(),
+         "app_name":         AppName,
+         "app_version":      AppVersion,
+         "device_model":     DeviceModel,
+         "os_version":       OSVersion,
+         "device_type":      deviceTypeID,
+         "device_serial":    DeviceID,
+         "software_version": SoftwareVersion,
+      },
+   }
+   body, err := json.MarshalIndent(payload, "", " ")
+   if err != nil {
+      return nil, err
+   }
+   req, err := http.NewRequest(
+      "POST", HostAmazonAPI+"/auth/create/codepair",
+      bytes.NewBuffer(body),
+   )
+   if err != nil {
+      return nil, err
+   }
+   req.Header.Set("content-type", "application/json")
+
+   resp, err := doRequest(req)
+   if err != nil {
+      return nil, err
+   }
+   defer resp.Body.Close()
+
+   if resp.StatusCode != http.StatusOK {
+      return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+   }
+
+   // Decode directly into our new struct type
+   var result CodePair
+   if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+      return nil, err
+   }
+
+   return &result, nil
+}
+
+func (*CodePair) CachePath() string {
+   return "rosso/amazon/CodePair"
+}
+
+func (c *CodePair) String() string {
+   var data strings.Builder
+   data.WriteString("Please navigate to https://amazon.com/gp/ontv\n")
+   data.WriteString("Enter the following code: ")
+   data.WriteString(c.PublicCode)
+   return data.String()
 }
 
 // Device represents the metadata for a supported hardware device.
@@ -239,51 +284,6 @@ type EntitlementMessaging struct {
    EntitlementMessageSlotDetail struct {
       Message string `json:"message"`
    } `json:"ENTITLEMENT_MESSAGE_SLOT_DETAIL"`
-}
-
-// PlaybackExperienceMetadata contains the envelope and related data needed for playback requests.
-type PlaybackExperienceMetadata struct {
-   PlaybackEnvelope string `json:"playbackEnvelope"`
-   ExpiryTime       int64  `json:"expiryTime"`
-   CorrelationId    string `json:"correlationId"`
-}
-
-func (*PlaybackExperienceMetadata) CachePath() string {
-   return "rosso/amazon/PlaybackExperienceMetadata"
-}
-
-// PlaybackUrls is the parent holding the intra-title playlists.
-type PlaybackUrls struct {
-   IntraTitlePlaylist []struct {
-      Type string `json:"type"`
-      Urls []struct {
-         Url string `json:"url"`
-         Cdn string `json:"cdn"` // Used to identify Akamai vs Cloudfront
-      } `json:"urls"`
-   } `json:"intraTitlePlaylist"`
-}
-
-// Clean extracts the Akamai MPD URL from the main playlist and sanitizes its path.
-// Returns an error if the Main playlist or Akamai CDN is not found.
-func (p *PlaybackUrls) Clean() (*url.URL, error) {
-   for _, playlist := range p.IntraTitlePlaylist {
-      if playlist.Type == "Main" {
-         if len(playlist.Urls) == 0 {
-            return nil, fmt.Errorf("no urls found in main playlist")
-         }
-
-         // Require Akamai to avoid the 30MB Cloudfront/Amazon MPD bloat
-         for _, u := range playlist.Urls {
-            if u.Cdn == "akamai" {
-               return trimURLPath(u.Url)
-            }
-         }
-
-         return nil, fmt.Errorf("akamai cdn not found in main playlist")
-      }
-   }
-
-   return nil, fmt.Errorf("main playlist not found in response")
 }
 
 // Profile represents an Amazon actor profile.
@@ -361,15 +361,24 @@ type Resource struct {
    ApplyHdr       bool `json:"applyHdr"`
    ApplyUhd       bool `json:"applyUhd"`
    PrimaryActions []struct {
+      NavigationAction struct {
+         PlaybackMetadata struct {
+            PlaybackExperienceMetadata PlaybackExperienceMetadata `json:"playbackExperienceMetadata"`
+         } `json:"playbackMetadata"`
+      } `json:"navigationAction"`
       OfferCards []struct {
          OfferCardDecoration struct {
             TransactionDetail []struct {
                Text string
             }
          }
-      }
-   }
+      } `json:"offerCards"`
+   } `json:"primaryActions"`
    EntitlementMessaging EntitlementMessaging `json:"entitlementMessaging"`
+
+   // raw is the undecoded response body, used as a last-resort search for the
+   // playback envelope when the server relocates it again.
+   raw []byte
 }
 
 // GetItemDetails uses the actor access token to get metadata for a specific title.
@@ -386,6 +395,12 @@ func GetItemDetails(token *ActorToken, titleId, deviceTypeID string) (*Resource,
    query := url.Values{}
    query.Set("itemId", titleId)
    query.Set("presentationScheme", "android-tv-react")
+   query.Set("widgetScheme", "lrc-detail-v4.2.1.1")
+   query.Set("clientId", "pv-lrc-rust")
+   query.Set("isReactionEnabledInDP", "true")
+   query.Set("newMaturityRatings", "true")
+   query.Set("dynamicBadgingEnabled", "true")
+   query.Set("isMapsV2DatumEnabled", "true")
    // Device parameters
    query.Set("deviceTypeID", deviceTypeID)
    query.Set("deviceID", DeviceID)
@@ -393,8 +408,10 @@ func GetItemDetails(token *ActorToken, titleId, deviceTypeID string) (*Resource,
    if token != nil {
       // Critical UI and Feature flags to force the V2/V3 BuyBox response with
       // PlaybackEnvelope
-      query.Set("roles", "playback-envelope-supported")
-      // you can get the envelope without this, but it will be trailer:
+      query.Set("roles", detailsATFRoles)
+      query.Set("clientFeatures", detailsATFClientFeatures)
+      query.Set("dynamicFeatures", detailsATFDynamicFeatures)
+      // you can get the envelope without the extra roles, but it will be trailer:
       // resource.secondaryActions[0].presentation.label = "Watch trailer"
       req.Header.Set("authorization", "Bearer "+token.Token)
    } else {
@@ -415,17 +432,25 @@ func GetItemDetails(token *ActorToken, titleId, deviceTypeID string) (*Resource,
       return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
    }
 
-   // Embed our new Resource struct into the anonymous decoder struct
+   // Keep the body so the envelope search can fall back to a full walk.
+   body, err := io.ReadAll(resp.Body)
+   if err != nil {
+      return nil, fmt.Errorf("failed to read response: %w", err)
+   }
+
    var result struct {
       Resource Resource `json:"resource"`
    }
-   if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+   if err := json.Unmarshal(body, &result); err != nil {
       return nil, err
    }
+   result.Resource.raw = body
    return &result.Resource, nil
 }
 
-// GetPlaybackExperienceMetadata searches the Actions array and returns the first valid PlaybackExperienceMetadata.
+// GetPlaybackExperienceMetadata returns the first playback envelope found in the
+// resource: the legacy "actions" list, then the modern "primaryActions" list,
+// then a full walk of the raw JSON in case the server moved it again.
 func (r *Resource) GetPlaybackExperienceMetadata() (*PlaybackExperienceMetadata, error) {
    for _, action := range r.Actions {
       pem := action.Metadata.PlaybackExperienceMetadata
@@ -433,7 +458,23 @@ func (r *Resource) GetPlaybackExperienceMetadata() (*PlaybackExperienceMetadata,
          return &pem, nil
       }
    }
-   return nil, fmt.Errorf("playbackExperienceMetadata not found in actions")
+   for _, action := range r.PrimaryActions {
+      pem := action.NavigationAction.PlaybackMetadata.PlaybackExperienceMetadata
+      if pem.PlaybackEnvelope != "" {
+         return &pem, nil
+      }
+   }
+   if len(r.raw) > 0 {
+      var tree any
+      if err := json.Unmarshal(r.raw, &tree); err == nil {
+         if pem := findPlaybackExperienceMetadata(tree); pem != nil {
+            return pem, nil
+         }
+      }
+   }
+   return nil, fmt.Errorf(
+      "playbackExperienceMetadata not found in actions, primaryActions or raw response",
+   )
 }
 
 func (r *Resource) String() string {
@@ -494,14 +535,15 @@ func PollRegister(codes *CodePair, deviceTypeID string) (*TokenPair, error) {
          },
       },
       "registration_data": map[string]string{
-         "app_name":      "AIV",
-         "app_version":   "9",
-         "device_model":  "device_model",
-         "device_serial": DeviceID,
-         "device_type":   deviceTypeID,
-         "os_version":    "Android",
-         // if you change deviceID this is required
-         "device_name": fmt.Sprint(time.Now().Unix()),
+         "domain":           DeviceDomain,
+         "device_name":      deviceName(),
+         "app_name":         AppName,
+         "app_version":      AppVersion,
+         "device_model":     DeviceModel,
+         "os_version":       OSVersion,
+         "device_type":      deviceTypeID,
+         "device_serial":    DeviceID,
+         "software_version": SoftwareVersion,
       },
       "requested_token_type": []string{"bearer"},
    }
@@ -515,6 +557,7 @@ func PollRegister(codes *CodePair, deviceTypeID string) (*TokenPair, error) {
    if err != nil {
       return nil, err
    }
+   req.Header.Set("content-type", "application/json")
 
    resp, err := doRequest(req)
    if err != nil {
@@ -609,114 +652,35 @@ func (t *TokenPair) Refresh() error {
    return nil
 }
 
-// VodPlaybackParams holds the configuration for fetching playback resources.
-type VodPlaybackParams struct {
-   ActorToken                 *ActorToken
-   TitleId                    string
-   PlaybackExperienceMetadata *PlaybackExperienceMetadata
-   DeviceTypeID               string
-   VideoCodec                 string // e.g., "H264" or "H265"
-   DRMType                    string // e.g., "Widevine" or "PlayReady"
-   BitrateAdaptation          string // e.g., "CBR" or "CVBR"
-   DynamicRangeFormat         string // e.g., "None", "DolbyVision", or "HDR10"
-   MaxVideoResolution         string // e.g., "576p" or "2160p"
+// Clean extracts the Akamai MPD URL from the main playlist and sanitizes its path.
+// Returns an error if the Main playlist or Akamai CDN is not found.
+func (p *PlaybackUrls) Clean() (*url.URL, error) {
+   for _, playlist := range p.IntraTitlePlaylist {
+      if playlist.Type == "Main" {
+         if len(playlist.Urls) == 0 {
+            return nil, fmt.Errorf("no urls found in main playlist")
+         }
+
+         // Require Akamai to avoid the 30MB Cloudfront/Amazon MPD bloat
+         for _, u := range playlist.Urls {
+            if u.Cdn == "akamai" {
+               return trimURLPath(u.Url)
+            }
+         }
+
+         return nil, fmt.Errorf("akamai cdn not found in main playlist")
+      }
+   }
+
+   return nil, fmt.Errorf("main playlist not found in response")
 }
 
-// Fetch requests the final MPD resources for playback from Amazon's API.
-func (p *VodPlaybackParams) Fetch() (*PlaybackUrls, error) {
-   if p == nil {
-      return nil, fmt.Errorf("VodPlaybackParams cannot be nil")
-   }
-   payload := map[string]any{
-      "vodPlaylistedPlaybackUrlsRequest": map[string]any{
-         "playbackSettingsRequest": map[string]any{
-            "firmware": "", // required but can be empty
-            "titleId":  p.TitleId,
-         },
-         "device": map[string]any{
-            "hdcpLevel":          "2.3", // at least 2.2 is needed for UHD with hev1
-            "maxVideoResolution": p.MaxVideoResolution,
-            "streamingTechnologies": map[string]any{
-               "DASH": map[string]any{
-                  "bitrateAdaptations":  []string{p.BitrateAdaptation},
-                  "codecs":              []string{p.VideoCodec},
-                  "drmType":             p.DRMType,
-                  "dynamicRangeFormats": []string{p.DynamicRangeFormat},
-               },
-            },
-            "supportedStreamingTechnologies": []string{"DASH"},
-         },
-      },
-      "globalParameters": map[string]any{
-         "playbackEnvelope":       p.PlaybackExperienceMetadata.PlaybackEnvelope,
-         "deviceCapabilityFamily": "LivingRoomPlayer",
-      },
-   }
-   body, err := json.Marshal(payload)
-   if err != nil {
-      return nil, err
-   }
-
-   urlStr := HostATVPS + "/playback/prs/GetVodPlaybackResources"
-   req, err := http.NewRequest("POST", urlStr, bytes.NewReader(body))
-   if err != nil {
-      return nil, err
-   }
-   query := url.Values{}
-   query.Set("deviceID", DeviceID)
-   query.Set("deviceTypeID", p.DeviceTypeID)
-   req.URL.RawQuery = query.Encode()
-   req.Header.Set("Authorization", "Bearer "+p.ActorToken.Token)
-
-   resp, err := doRequest(req)
-   if err != nil {
-      return nil, err
-   }
-   defer resp.Body.Close()
-
-   if resp.StatusCode != http.StatusOK {
-      return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-   }
-
-   var result struct {
-      GlobalError struct {
-         Code    string `json:"code"`
-         Message string `json:"message"`
-      } `json:"globalError"`
-      VodPlaylistedPlaybackUrls struct {
-         Result struct {
-            PlaybackUrls PlaybackUrls `json:"playbackUrls"`
-         } `json:"result"`
-         Error struct {
-            Message string `json:"message"`
-         } `json:"error"`
-      } `json:"vodPlaylistedPlaybackUrls"`
-   }
-
-   if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-      return nil, err
-   }
-
-   if result.GlobalError.Code != "" {
-      return nil, fmt.Errorf("global API error: [%s] %s", result.GlobalError.Code, result.GlobalError.Message)
-   }
-
-   if result.VodPlaylistedPlaybackUrls.Error.Message != "" {
-      return nil, fmt.Errorf("API error: %s", result.VodPlaylistedPlaybackUrls.Error.Message)
-   }
-
-   // Return the parent struct holding the playlists
-   return &result.VodPlaylistedPlaybackUrls.Result.PlaybackUrls, nil
+func (*ActorToken) CachePath() string {
+   return "rosso/amazon/ActorToken"
 }
 
-func (*CodePair) CachePath() string {
-   return "rosso/amazon/CodePair"
+func (*PlaybackExperienceMetadata) CachePath() string {
+   return "rosso/amazon/PlaybackExperienceMetadata"
 }
 
-func (c *CodePair) String() string {
-   var data strings.Builder
-   data.WriteString("Please navigate to https://amazon.com/gp/video/ontv\n")
-   data.WriteString("Enter the following code: ")
-   data.WriteString(c.PublicCode)
-   return data.String()
-}
+// 0.go marker preserve
