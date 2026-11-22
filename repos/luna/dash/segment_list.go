@@ -1,16 +1,45 @@
-// segment_list.go marker preserve
+// segment_list.go KEEP THIS LINE
+
 package dash
 
-import "net/url"
+import (
+   "errors"
+   "net/url"
+)
 
-// SegmentList contains a list of SegmentUrls.
+// Initialization points at the initialization segment of a Representation.
+type Initialization struct {
+   Range     string `xml:"range,attr"`     // SegmentBase
+   SourceUrl string `xml:"sourceURL,attr"` // SegmentList
+
+   parent *SegmentList
+}
+
+func (i *Initialization) ResolveSourceUrl() (*url.URL, error) {
+   if i.parent == nil {
+      return url.Parse(i.SourceUrl)
+   }
+   base, err := i.parent.parentBaseUrl()
+   if err != nil {
+      return nil, err
+   }
+   return resolveRef(base, i.SourceUrl)
+}
+
+// SegmentBase describes segments addressed as byte ranges of one resource.
+type SegmentBase struct {
+   IndexRange     string          `xml:"indexRange,attr"`
+   Initialization *Initialization `xml:"Initialization"`
+}
+
+// SegmentList enumerates the segments of a Representation.
 type SegmentList struct {
    Duration       uint            `xml:"duration,attr"`
    Timescale      *uint           `xml:"timescale,attr"`
    Initialization *Initialization `xml:"Initialization"`
    SegmentUrls    []*SegmentUrl   `xml:"SegmentURL"`
-   // Navigation
-   Parent *Representation `xml:"-"`
+
+   parent *Representation
 }
 
 func (sl *SegmentList) GetTimescale() uint {
@@ -20,34 +49,39 @@ func (sl *SegmentList) GetTimescale() uint {
    return 1
 }
 
-func (sl *SegmentList) getParentBaseUrl() (*url.URL, error) {
-   return sl.Parent.ResolveBaseUrl()
-}
-
 func (sl *SegmentList) link() {
    if sl.Initialization != nil {
-      sl.Initialization.Parent = sl
+      sl.Initialization.parent = sl
    }
-   for _, mediaUrl := range sl.SegmentUrls {
-      mediaUrl.Parent = sl
+   for _, segment := range sl.SegmentUrls {
+      segment.parent = sl
    }
 }
 
-// SegmentUrl defines a specific media segment source.
+func (sl *SegmentList) parentBaseUrl() (*url.URL, error) {
+   if sl.parent == nil {
+      return nil, errors.New("dash: segment list has no parent representation")
+   }
+   return sl.parent.ResolveBaseUrl()
+}
+
+// SegmentUrl is one media segment of a SegmentList.
 type SegmentUrl struct {
    Media      string `xml:"media,attr"`
-   MediaRange string `xml:"mediaRange,attr"` // Add this to capture the byte range
-   // Navigation
-   Parent *SegmentList `xml:"-"`
+   MediaRange string `xml:"mediaRange,attr"`
+
+   parent *SegmentList
 }
 
-// ResolveMedia resolves the @media attribute against the parent SegmentList's context.
 func (su *SegmentUrl) ResolveMedia() (*url.URL, error) {
-   base, err := su.Parent.getParentBaseUrl()
+   if su.parent == nil {
+      return nil, errors.New("dash: segment url is not linked to a segment list")
+   }
+   base, err := su.parent.parentBaseUrl()
    if err != nil {
       return nil, err
    }
    return resolveRef(base, su.Media)
 }
 
-// segment_list.go marker preserve
+// segment_list.go KEEP THIS LINE

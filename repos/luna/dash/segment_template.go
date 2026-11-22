@@ -1,4 +1,5 @@
-// segment_template.go marker preserve
+// segment_template.go KEEP THIS LINE
+
 package dash
 
 import (
@@ -6,16 +7,18 @@ import (
    "fmt"
    "math"
    "net/url"
+   "strconv"
    "strings"
 )
 
-// S represents a segment within the timeline.
+// S is one SegmentTimeline entry.
 type S struct {
-   D uint `xml:"d,attr"` // Duration
-   R int  `xml:"r,attr"` // Repeat count
+   D uint `xml:"d,attr"` // duration in timescale units
+   R int  `xml:"r,attr"` // repeat count
 }
 
-// SegmentTemplate defines specific rules for generating segment URLs.
+// SegmentTemplate generates media URLs from a template plus a numbering or
+// timing scheme.
 type SegmentTemplate struct {
    Duration               uint             `xml:"duration,attr"`
    EndNumber              uint             `xml:"endNumber,attr"`
@@ -25,142 +28,28 @@ type SegmentTemplate struct {
    StartNumber            *uint            `xml:"startNumber,attr"`
    Timescale              *uint            `xml:"timescale,attr"`
    SegmentTimeline        *SegmentTimeline `xml:"SegmentTimeline"`
-   // Navigation
-   ParentAdaptationSet  *AdaptationSet  `xml:"-"`
-   ParentRepresentation *Representation `xml:"-"`
+
+   parentAdaptationSet  *AdaptationSet
+   parentRepresentation *Representation
 }
 
-func (st *SegmentTemplate) GetDurationBasedNumbers() ([]uint, error) {
-   var manifestPeriod *Period
-   if st.ParentRepresentation != nil && st.ParentRepresentation.Parent != nil {
-      manifestPeriod = st.ParentRepresentation.Parent.Parent
-   } else if st.ParentAdaptationSet != nil {
-      manifestPeriod = st.ParentAdaptationSet.Parent
-   }
-   if manifestPeriod == nil {
-      return nil, errors.New("SegmentTemplate is not properly linked to a Period")
-   }
-   pDuration, err := manifestPeriod.GetDuration()
-   if err != nil {
-      return nil, err
-   }
-   if pDuration == 0 {
-      return nil, errors.New("period duration is zero or missing")
-   }
-   if st.Duration == 0 {
-      return nil, errors.New("SegmentTemplate duration is zero")
-   }
-   segDurSec := float64(st.Duration) / float64(st.GetTimescale())
-   count := uint(math.Ceil(pDuration.Seconds() / segDurSec))
-   start := st.GetStartNumber()
-   numbers := make([]uint, count)
-   for idx := uint(0); idx < count; idx++ {
-      numbers[idx] = start + idx
-   }
-   return numbers, nil
-}
-
-func (st *SegmentTemplate) GetNumberRange() []uint {
-   start := st.GetStartNumber()
-   end := st.EndNumber
-   if end < start {
-      return nil
-   }
-   size := end - start + 1
-   nums := make([]uint, size)
-   for idx := uint(0); idx < size; idx++ {
-      nums[idx] = start + idx
-   }
-   return nums
-}
-
+// GetSegmentUrls returns the media URLs produced by the template.
 func (st *SegmentTemplate) GetSegmentUrls(rep *Representation) ([]*url.URL, error) {
    if st.Media == "" {
       return nil, nil
    }
    if strings.Contains(st.Media, "$Time$") {
-      times := st.GetTimelineTimes()
+      times := st.getTimelineTimes()
       if len(times) == 0 {
-         return nil, errors.New("media template requires $Time$ but no SegmentTimeline found")
+         return nil, errors.New("dash: $Time$ media template without a SegmentTimeline")
       }
-      var urls []*url.URL
-      for _, timeVal := range times {
-         parsedUrl, err := st.ResolveMediaTime(rep, int(timeVal))
-         if err != nil {
-            return nil, err
-         }
-         urls = append(urls, parsedUrl)
-      }
-      return urls, nil
+      return st.resolveAll(rep, times, st.resolveMediaTime)
    }
-   var numbers []uint
-   if st.SegmentTimeline != nil {
-      numbers = st.GetTimelineNumbers()
+   numbers, err := st.segmentNumbers()
+   if err != nil {
+      return nil, err
    }
-   if len(numbers) == 0 && st.EndNumber > 0 {
-      numbers = st.GetNumberRange()
-   }
-   if len(numbers) == 0 && st.Duration > 0 {
-      var err error
-      numbers, err = st.GetDurationBasedNumbers()
-      if err != nil {
-         return nil, err
-      }
-   }
-   var urls []*url.URL
-   for _, num := range numbers {
-      parsedUrl, err := st.ResolveMedia(rep, int(num))
-      if err != nil {
-         return nil, err
-      }
-      urls = append(urls, parsedUrl)
-   }
-   return urls, nil
-}
-
-func (st *SegmentTemplate) GetStartNumber() uint {
-   if st.StartNumber != nil {
-      return *st.StartNumber
-   }
-   return 1
-}
-
-func (st *SegmentTemplate) GetTimelineNumbers() []uint {
-   if st.SegmentTimeline == nil {
-      return nil
-   }
-   var numbers []uint
-   current := st.GetStartNumber()
-   for _, segment := range st.SegmentTimeline.S {
-      count := 1
-      if segment.R > 0 {
-         count += segment.R
-      }
-      for idx := 0; idx < count; idx++ {
-         numbers = append(numbers, current)
-         current++
-      }
-   }
-   return numbers
-}
-
-func (st *SegmentTemplate) GetTimelineTimes() []uint {
-   if st.SegmentTimeline == nil {
-      return nil
-   }
-   var times []uint
-   currentTime := st.PresentationTimeOffset
-   for _, segment := range st.SegmentTimeline.S {
-      count := 1
-      if segment.R > 0 {
-         count += segment.R
-      }
-      for idx := 0; idx < count; idx++ {
-         times = append(times, currentTime)
-         currentTime += segment.D
-      }
-   }
-   return times
+   return st.resolveAll(rep, numbers, st.resolveMedia)
 }
 
 func (st *SegmentTemplate) GetTimescale() uint {
@@ -171,68 +60,174 @@ func (st *SegmentTemplate) GetTimescale() uint {
 }
 
 func (st *SegmentTemplate) ResolveInitialization(rep *Representation) (*url.URL, error) {
-   base, initStr, err := st.prepareTemplateString(rep, st.Initialization)
+   base, tmpl, err := st.prepare(rep, st.Initialization)
    if err != nil {
       return nil, err
    }
-   return resolveRef(base, initStr)
+   return resolveRef(base, tmpl)
 }
 
-func (st *SegmentTemplate) ResolveMedia(rep *Representation, number int) (*url.URL, error) {
-   base, mediaStr, err := st.prepareTemplateString(rep, st.Media)
+// getDurationBasedNumbers expands the fixed duration across the period.
+func (st *SegmentTemplate) getDurationBasedNumbers() ([]uint, error) {
+   period := st.period()
+   if period == nil {
+      return nil, errors.New("dash: segment template is not linked to a period")
+   }
+   if st.Duration == 0 {
+      return nil, errors.New("dash: segment template duration is zero")
+   }
+   total, err := period.GetDuration()
    if err != nil {
       return nil, err
    }
-   formats := []string{"%02d", "%03d", "%04d", "%05d", "%06d", "%07d", "%08d", "%09d"}
-   for _, format := range formats {
-      token := fmt.Sprintf("$Number%s$", format)
-      if strings.Contains(mediaStr, token) {
-         mediaStr = strings.ReplaceAll(mediaStr, token, fmt.Sprintf(format, number))
-      }
+   if total == 0 {
+      return nil, errors.New("dash: period duration is zero or missing")
    }
-   mediaStr = strings.ReplaceAll(mediaStr, "$Number$", fmt.Sprint(number))
-   return resolveRef(base, mediaStr)
+   segment := float64(st.Duration) / float64(st.GetTimescale())
+   count := uint(math.Ceil(total.Seconds() / segment))
+   start := st.getStartNumber()
+   numbers := make([]uint, count)
+   for i := range numbers {
+      numbers[i] = start + uint(i)
+   }
+   return numbers, nil
 }
 
-func (st *SegmentTemplate) ResolveMediaTime(rep *Representation, timeVal int) (*url.URL, error) {
-   base, mediaStr, err := st.prepareTemplateString(rep, st.Media)
-   if err != nil {
-      return nil, err
+func (st *SegmentTemplate) getNumberRange() []uint {
+   start := st.getStartNumber()
+   if st.EndNumber < start {
+      return nil
    }
-   mediaStr = strings.ReplaceAll(mediaStr, "$Time$", fmt.Sprint(timeVal))
-   return resolveRef(base, mediaStr)
+   numbers := make([]uint, st.EndNumber-start+1)
+   for i := range numbers {
+      numbers[i] = start + uint(i)
+   }
+   return numbers
 }
 
-func (st *SegmentTemplate) getParentBaseUrl() (*url.URL, error) {
-   if st.ParentRepresentation != nil {
-      return st.ParentRepresentation.ResolveBaseUrl()
+func (st *SegmentTemplate) getStartNumber() uint {
+   if st.StartNumber != nil {
+      return *st.StartNumber
    }
-   if st.ParentAdaptationSet != nil {
-      return st.ParentAdaptationSet.getAbsoluteBaseUrl()
-   }
-   return nil, errors.New("SegmentTemplate has no parent linked")
+   return 1
 }
 
-func (st *SegmentTemplate) prepareTemplateString(rep *Representation, templateStr string) (*url.URL, string, error) {
-   base, err := st.getParentBaseUrl()
+// getTimelineNumbers returns the segment numbers described by the timeline.
+func (st *SegmentTemplate) getTimelineNumbers() []uint {
+   numbers, _ := st.timeline()
+   return numbers
+}
+
+// getTimelineTimes returns the presentation times described by the timeline.
+func (st *SegmentTemplate) getTimelineTimes() []uint {
+   _, times := st.timeline()
+   return times
+}
+
+func (st *SegmentTemplate) parentBaseUrl() (*url.URL, error) {
+   switch {
+   case st.parentRepresentation != nil:
+      return st.parentRepresentation.ResolveBaseUrl()
+   case st.parentAdaptationSet != nil:
+      return st.parentAdaptationSet.resolveBaseUrl()
+   default:
+      return nil, errors.New("dash: segment template has no parent")
+   }
+}
+
+func (st *SegmentTemplate) period() *Period {
+   if st.parentRepresentation != nil && st.parentRepresentation.Parent != nil {
+      return st.parentRepresentation.Parent.Parent
+   }
+   if st.parentAdaptationSet != nil {
+      return st.parentAdaptationSet.Parent
+   }
+   return nil
+}
+
+// prepare resolves the base URL and expands $RepresentationID$.
+func (st *SegmentTemplate) prepare(rep *Representation, tmpl string) (*url.URL, string, error) {
+   base, err := st.parentBaseUrl()
    if err != nil {
       return nil, "", err
    }
-   var repId string
+   id := ""
    if rep != nil {
-      repId = rep.Id
-   } else if st.ParentRepresentation != nil {
-      repId = st.ParentRepresentation.Id
+      id = rep.Id
+   } else if st.parentRepresentation != nil {
+      id = st.parentRepresentation.Id
    }
-   if repId != "" {
-      templateStr = strings.ReplaceAll(templateStr, "$RepresentationID$", repId)
+   if id != "" {
+      tmpl = strings.ReplaceAll(tmpl, "$RepresentationID$", id)
    }
-   return base, templateStr, nil
+   return base, tmpl, nil
 }
 
-// SegmentTimeline defines specific timing for segments.
+func (st *SegmentTemplate) resolveAll(rep *Representation, values []uint, resolve func(*Representation, int) (*url.URL, error)) ([]*url.URL, error) {
+   var urls []*url.URL
+   for _, v := range values {
+      u, err := resolve(rep, int(v))
+      if err != nil {
+         return nil, err
+      }
+      urls = append(urls, u)
+   }
+   return urls, nil
+}
+
+func (st *SegmentTemplate) resolveMedia(rep *Representation, number int) (*url.URL, error) {
+   base, tmpl, err := st.prepare(rep, st.Media)
+   if err != nil {
+      return nil, err
+   }
+   for width := 2; width <= 9; width++ {
+      tmpl = strings.ReplaceAll(tmpl, fmt.Sprintf("$Number%%0%dd$", width), fmt.Sprintf("%0*d", width, number))
+   }
+   return resolveRef(base, strings.ReplaceAll(tmpl, "$Number$", strconv.Itoa(number)))
+}
+
+func (st *SegmentTemplate) resolveMediaTime(rep *Representation, timestamp int) (*url.URL, error) {
+   base, tmpl, err := st.prepare(rep, st.Media)
+   if err != nil {
+      return nil, err
+   }
+   return resolveRef(base, strings.ReplaceAll(tmpl, "$Time$", strconv.Itoa(timestamp)))
+}
+
+func (st *SegmentTemplate) segmentNumbers() ([]uint, error) {
+   if nums := st.getTimelineNumbers(); len(nums) > 0 {
+      return nums, nil
+   }
+   if st.EndNumber > 0 {
+      if nums := st.getNumberRange(); len(nums) > 0 {
+         return nums, nil
+      }
+   }
+   if st.Duration == 0 {
+      return nil, nil
+   }
+   return st.getDurationBasedNumbers()
+}
+
+func (st *SegmentTemplate) timeline() (numbers, times []uint) {
+   if st.SegmentTimeline == nil {
+      return nil, nil
+   }
+   number, time := st.getStartNumber(), st.PresentationTimeOffset
+   for _, s := range st.SegmentTimeline.S {
+      for repeat := max(s.R, 0) + 1; repeat > 0; repeat-- {
+         numbers = append(numbers, number)
+         times = append(times, time)
+         number++
+         time += s.D
+      }
+   }
+   return numbers, times
+}
+
+// SegmentTimeline lists segment durations explicitly.
 type SegmentTimeline struct {
    S []*S `xml:"S"`
 }
 
-// segment_template.go marker preserve
+// segment_template.go KEEP THIS LINE

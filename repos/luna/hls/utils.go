@@ -1,127 +1,126 @@
-// utils.go marker preserve
+// utils.go KEEP THIS LINE
+
 package hls
 
 import (
-   "encoding/base64"
    "errors"
    "fmt"
    "net/url"
+   "strconv"
    "strings"
 )
 
-// parseAttributes parses HLS attribute lists (e.g., KEY="VAL",KEY2=VAL).
-// It handles quoted strings containing commas.
-func parseAttributes(line string, tagPrefix string) map[string]string {
-   line = strings.TrimPrefix(line, tagPrefix)
-   attributes := make(map[string]string)
+const (
+   keyTag       = "#EXT-X-KEY:"
+   mapTag       = "#EXT-X-MAP:"
+   extInfTag    = "#EXTINF:"
+   mediaTag     = "#EXT-X-MEDIA:"
+   streamInfTag = "#EXT-X-STREAM-INF:"
+)
 
-   var keyBuilder, valueBuilder strings.Builder
-   inKey := true
-   inQuote := false
+// atoiAttr parses an integer attribute, returning 0 when it is absent.
+func atoiAttr(attrs map[string]string, key string) (int, error) {
+   raw := attrs[key]
+   if raw == "" {
+      return 0, nil
+   }
+   n, err := strconv.Atoi(raw)
+   if err != nil {
+      return 0, fmt.Errorf("invalid %s: %w", key, err)
+   }
+   return n, nil
+}
 
-   for i := 0; i < len(line); i++ {
-      char := line[i]
+// checkHeader verifies the mandatory #EXTM3U prologue.
+func checkHeader(lines []string) error {
+   if len(lines) == 0 || lines[0] != "#EXTM3U" {
+      return errors.New("not an HLS playlist: missing #EXTM3U")
+   }
+   return nil
+}
 
-      if inKey {
-         if char == '=' {
-            inKey = false
-         } else {
-            keyBuilder.WriteByte(char)
+// parseAttributes parses an attribute list such as METHOD=AES-128,URI="k.bin".
+// Quoted values may contain commas and the quotes themselves are stripped.
+func parseAttributes(line, prefix string) (map[string]string, error) {
+   attrs := make(map[string]string)
+   var key, value strings.Builder
+   inValue, quoted := false, false
+
+   flush := func() error {
+      if key.Len() == 0 {
+         return nil
+      }
+      if !inValue {
+         return fmt.Errorf("invalid attribute %q: missing '='", key.String())
+      }
+      attrs[strings.TrimSpace(key.String())] = strings.Trim(value.String(), `"`)
+      key.Reset()
+      value.Reset()
+      inValue = false
+      return nil
+   }
+
+   for _, r := range strings.TrimPrefix(line, prefix) {
+      switch {
+      case r == '"':
+         quoted = !quoted
+      case quoted:
+         value.WriteRune(r)
+      case r == ',':
+         if err := flush(); err != nil {
+            return nil, err
          }
-      } else {
-         // Inside the value part
-         if char == '"' {
-            inQuote = !inQuote
-            continue // Skip the actual quote character
-         }
-
-         // If we hit a comma and we are NOT in a quote, it's the end of the pair
-         if char == ',' && !inQuote {
-            keyString := strings.TrimSpace(keyBuilder.String())
-            valueString := valueBuilder.String()
-            attributes[keyString] = valueString
-
-            // Reset
-            keyBuilder.Reset()
-            valueBuilder.Reset()
-            inKey = true
-         } else {
-            valueBuilder.WriteByte(char)
-         }
+      case r == '=' && !inValue:
+         inValue = true
+      case inValue:
+         value.WriteRune(r)
+      default:
+         key.WriteRune(r)
       }
    }
-
-   // Flush the final pair
-   if keyBuilder.Len() > 0 {
-      keyString := strings.TrimSpace(keyBuilder.String())
-      valueString := valueBuilder.String()
-      attributes[keyString] = valueString
-   }
-
-   return attributes
+   return attrs, flush()
 }
 
-// Helper to split lines, ignoring empty lines and carriage returns,
-// but preserving leading/trailing spaces.
+// resolveReference resolves ref against base; a nil on either side returns ref.
+func resolveReference(base, ref *url.URL) *url.URL {
+   if base == nil || ref == nil {
+      return ref
+   }
+   return base.ResolveReference(ref)
+}
+
+// splitLines splits a playlist into non-empty lines, preserving spaces.
 func splitLines(content string) []string {
-   return strings.FieldsFunc(content, func(r rune) bool {
-      return r == '\n' || r == '\r'
-   })
+   return strings.FieldsFunc(content, func(r rune) bool { return r == '\n' || r == '\r' })
 }
 
-// Key represents encryption info from a #EXT-X-KEY tag.
-type Key struct {
-   Method            string
-   Uri               *url.URL
-   KeyFormat         string
-   KeyFormatVersions string
-   Characteristics   string
+// key is the encryption information of an #EXT-X-KEY tag.
+type key struct {
+   method            string
+   uri               *url.URL
+   keyFormat         string
+   keyFormatVersions string
+   characteristics   string
 }
 
-func parseKey(line string) (*Key, error) {
-   prefix := "#EXT-X-KEY:"
-   attrs := parseAttributes(line, prefix)
-   newKey := &Key{
-      Method:            attrs["METHOD"],
-      KeyFormat:         attrs["KEYFORMAT"],
-      KeyFormatVersions: attrs["KEYFORMATVERSIONS"],
-      Characteristics:   attrs["CHARACTERISTICS"],
+func parseKey(line string) (*key, error) {
+   attrs, err := parseAttributes(line, keyTag)
+   if err != nil {
+      return nil, fmt.Errorf("invalid EXT-X-KEY: %w", err)
    }
-   if value, ok := attrs["URI"]; ok && value != "" {
-      parsedUrl, err := url.Parse(value)
-      if err != nil {
+
+   k := &key{
+      method:            attrs["METHOD"],
+      keyFormat:         attrs["KEYFORMAT"],
+      keyFormatVersions: attrs["KEYFORMATVERSIONS"],
+      characteristics:   attrs["CHARACTERISTICS"],
+   }
+   if uri := attrs["URI"]; uri != "" {
+      if k.uri, err = url.Parse(uri); err != nil {
          return nil, fmt.Errorf("invalid URI in EXT-X-KEY: %w", err)
       }
-      newKey.Uri = parsedUrl
    }
-   return newKey, nil
+   return k, nil
 }
 
-// DecodeData extracts and decodes the Base64 data directly from the URL Opaque field.
-func (k *Key) DecodeData() ([]byte, error) {
-   if k.Uri == nil {
-      return nil, errors.New("URI is nil")
-   }
-   if k.Uri.Scheme != "data" {
-      return nil, errors.New("URI is not a data URI")
-   }
-   // For data URIs, net/url stores the content (mime+encoding+data) in Opaque.
-   // Format: [<mediatype>][;base64],<data>
-   meta, dataString, found := strings.Cut(k.Uri.Opaque, ",")
-   if !found {
-      return nil, errors.New("invalid data URI: missing comma separator")
-   }
-   // Verify base64 encoding is specified in the metadata (before the comma)
-   if !strings.Contains(meta, ";base64") {
-      return nil, errors.New("data URI does not contain base64 indicator")
-   }
-   return base64.StdEncoding.DecodeString(dataString)
-}
-
-func (k *Key) resolve(base *url.URL) {
-   if k.Uri != nil {
-      k.Uri = base.ResolveReference(k.Uri)
-   }
-}
-
-// utils.go marker preserve
+// utils.go KEEP THIS LINE
